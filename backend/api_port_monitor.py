@@ -3,14 +3,16 @@
 Provides endpoints to list Docker containers, and to create, update,
 delete, recheck and restart port monitoring stacks. Events are emitted to
 the UI event log for important actions.
+
+Handlers are async; blocking docker/filesystem work in the manager is offloaded
+to a worker thread via ``asyncio.to_thread`` so the event loop is never blocked.
 """
 
 import asyncio
 from datetime import UTC, datetime
 import logging
-import threading
 import time
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -20,30 +22,58 @@ from backend.port_monitor import port_monitor_manager
 
 _logger: logging.Logger = logging.getLogger(__name__)
 _CONTAINER_WARN_INTERVAL = 60
-_last_container_warn = 0.0
+_last_container_warn = {"ts": 0.0}
+# Strong references to in-flight background restart tasks so they are not GC'd.
+_background_tasks: set[asyncio.Task[None]] = set()
 router = APIRouter()
+
+
+def _stack_event(
+    *,
+    event: str,
+    event_type: str,
+    name: str,
+    status_message: str,
+    message: str,
+    details: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a UI event-log payload for a port-monitor stack lifecycle action."""
+    return {
+        "event": event,
+        "event_type": event_type,
+        "label": name,
+        "stack": name,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "status_message": status_message,
+        "details": details,
+        "message": message,
+        "level": "info",
+    }
+
+
+def _container_names(client: Any) -> list[str]:
+    """Return running container names via the (blocking) docker client."""
+    return [c.name for c in client.containers.list()]
 
 
 # List Docker containers endpoint
 @router.get("/containers", response_model=list[str])
-def list_containers() -> list[str]:
+async def list_containers() -> list[str]:
     """Returns a list of running Docker container names."""
-    client = port_monitor_manager.get_docker_client()
+    client = await asyncio.to_thread(port_monitor_manager.get_docker_client)
     if not client:
         # Docker client unavailable (SDK missing or unable to connect)
         # Return an empty list for graceful degradation in environments
         # where Docker is not present (e.g., dev without docker socket).
-        global _last_container_warn  # noqa: PLW0603
         now = time.monotonic()
-        if now - _last_container_warn >= _CONTAINER_WARN_INTERVAL:
+        if now - _last_container_warn["ts"] >= _CONTAINER_WARN_INTERVAL:
             _logger.warning(
                 "[PortMonitorAPI] Docker client not available when listing containers; returning empty list"
             )
-            _last_container_warn = now
+            _last_container_warn["ts"] = now
         return []
     try:
-        containers = client.containers.list()
-        return [c.name for c in containers]
+        return await asyncio.to_thread(_container_names, client)
     except Exception as e:
         _logger.exception("[PortMonitorAPI] Error listing containers")
         raise HTTPException(status_code=500, detail=f"Error listing containers: {e}") from e
@@ -64,8 +94,9 @@ class UpdatePortMonitorStackRequest(BaseModel):
 
 
 @router.put("/stacks", response_model=dict)
-def update_stack(
-    name: str = Query(..., description="Stack name"), req: UpdatePortMonitorStackRequest = Body(...)
+async def update_stack(
+    name: Annotated[str, Query(description="Stack name")],
+    req: Annotated[UpdatePortMonitorStackRequest, Body()],
 ) -> dict[str, Any]:
     """Update fields for a named port monitor stack and trigger a recheck.
 
@@ -79,47 +110,37 @@ def update_stack(
     if not stack:
         raise HTTPException(status_code=404, detail="Stack not found")
     # Only log if something actually changed
-    changed = (
-        stack.primary_container != req.primary_container
-        or stack.primary_port != req.primary_port
-        or stack.secondary_containers != req.secondary_containers
-        or stack.interval != req.interval
-    )
     old_values = {
         "primary_container": stack.primary_container,
         "primary_port": stack.primary_port,
         "secondary_containers": stack.secondary_containers,
         "interval": stack.interval,
     }
+    new_values = {
+        "primary_container": req.primary_container,
+        "primary_port": req.primary_port,
+        "secondary_containers": req.secondary_containers,
+        "interval": req.interval,
+    }
+    changed = old_values != new_values
     stack.primary_container = req.primary_container
     stack.primary_port = req.primary_port
     stack.secondary_containers = req.secondary_containers
     stack.interval = req.interval
     stack.public_ip = req.public_ip
-    port_monitor_manager.save_stacks()
+    await asyncio.to_thread(port_monitor_manager.save_stacks)
     # Immediately recheck status after edit
-    port_monitor_manager.recheck_stack(name)
+    await asyncio.to_thread(port_monitor_manager.recheck_stack, name)
     if changed:
-        append_ui_event_log(
-            {
-                "event": "port_monitor_edit",
-                "event_type": "port_monitor_edit",
-                "label": name,
-                "stack": name,
-                "timestamp": datetime.now(UTC).isoformat(),
-                "status_message": f"Stack '{name}' edited: primary={req.primary_container}:{req.primary_port}, secondaries={req.secondary_containers}, interval={req.interval} minutes.",
-                "details": {
-                    "old": old_values,
-                    "new": {
-                        "primary_container": req.primary_container,
-                        "primary_port": req.primary_port,
-                        "secondary_containers": req.secondary_containers,
-                        "interval": req.interval,
-                    },
-                },
-                "message": f"Stack '{name}' edited",
-                "level": "info",
-            }
+        await append_ui_event_log(
+            _stack_event(
+                event="port_monitor_edit",
+                event_type="port_monitor_edit",
+                name=name,
+                status_message=f"Stack '{name}' edited: primary={req.primary_container}:{req.primary_port}, secondaries={req.secondary_containers}, interval={req.interval} minutes.",
+                message=f"Stack '{name}' edited",
+                details={"old": old_values, "new": new_values},
+            )
         )
     return {"success": True}
 
@@ -154,9 +175,6 @@ class AddPortMonitorStackRequest(BaseModel):
     public_ip: str | None = None
 
 
-# Add update model and endpoint after router definition
-
-
 @router.get("/stacks", response_model=list[PortMonitorStackModel])
 def list_stacks() -> list[PortMonitorStackModel]:
     """Return the configured port monitor stacks in the API response model."""
@@ -179,10 +197,11 @@ def list_stacks() -> list[PortMonitorStackModel]:
 
 
 @router.post("/stacks", response_model=dict)
-def add_stack(req: AddPortMonitorStackRequest) -> dict[str, Any]:
+async def add_stack(req: AddPortMonitorStackRequest) -> dict[str, Any]:
     """Create a new port monitor stack and emit a UI event about it."""
 
-    port_monitor_manager.add_stack(
+    await asyncio.to_thread(
+        port_monitor_manager.add_stack,
         req.name,
         req.primary_container,
         req.primary_port,
@@ -191,68 +210,62 @@ def add_stack(req: AddPortMonitorStackRequest) -> dict[str, Any]:
         req.public_ip,
     )
 
-    append_ui_event_log(
-        {
-            "event": "port_monitor_created",
-            "event_type": "port_monitor_create",
-            "label": req.name,
-            "stack": req.name,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "status_message": f"Stack '{req.name}' created: primary={req.primary_container}:{req.primary_port}, secondaries={req.secondary_containers}, interval={req.interval} minutes.",
-            "details": {
+    await append_ui_event_log(
+        _stack_event(
+            event="port_monitor_created",
+            event_type="port_monitor_create",
+            name=req.name,
+            status_message=f"Stack '{req.name}' created: primary={req.primary_container}:{req.primary_port}, secondaries={req.secondary_containers}, interval={req.interval} minutes.",
+            message=f"Stack '{req.name}' created.",
+            details={
                 "primary_container": req.primary_container,
                 "primary_port": req.primary_port,
                 "secondary_containers": req.secondary_containers,
                 "interval": req.interval,
             },
-            "message": f"Stack '{req.name}' created.",
-            "level": "info",
-        }
+        )
     )
     return {"success": True}
 
 
 @router.post("/stacks/recheck", response_model=dict)
-def recheck_stack(name: str = Query(..., description="Stack name")) -> dict[str, Any]:
+async def recheck_stack(name: Annotated[str, Query(description="Stack name")]) -> dict[str, Any]:
     """Trigger an immediate recheck of the named stack.
 
     Returns success if the stack exists and was rechecked; otherwise raises
     HTTP 404.
     """
 
-    ok = port_monitor_manager.recheck_stack(name)
+    ok = await asyncio.to_thread(port_monitor_manager.recheck_stack, name)
     if not ok:
         raise HTTPException(status_code=404, detail="Stack not found")
     return {"success": True}
 
 
 @router.delete("/stacks", response_model=dict)
-def delete_stack(name: str = Query(..., description="Stack name")) -> dict[str, Any]:
+async def delete_stack(name: Annotated[str, Query(description="Stack name")]) -> dict[str, Any]:
     """Remove a configured stack by name and emit a UI event about deletion."""
 
-    port_monitor_manager.remove_stack(name)
-    append_ui_event_log(
-        {
-            "event": "port_monitor_deleted",
-            "event_type": "port_monitor_delete",
-            "label": name,
-            "stack": name,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "status_message": f"Stack '{name}' deleted.",
-            "details": {},
-            "message": f"Stack '{name}' deleted.",
-            "level": "info",
-        }
+    await asyncio.to_thread(port_monitor_manager.remove_stack, name)
+    await append_ui_event_log(
+        _stack_event(
+            event="port_monitor_deleted",
+            event_type="port_monitor_delete",
+            name=name,
+            status_message=f"Stack '{name}' deleted.",
+            message=f"Stack '{name}' deleted.",
+            details={},
+        )
     )
     return {"success": True}
 
 
 @router.post("/stacks/restart", response_model=dict)
-def restart_stack(name: str = Query(..., description="Stack name")) -> dict[str, Any]:
-    """Initiate a restart for a stack's primary container in background.
+async def restart_stack(name: Annotated[str, Query(description="Stack name")]) -> dict[str, Any]:
+    """Initiate a restart for a stack's primary container in the background.
 
-    Marks the stack restarting and runs the restart work in a daemon
-    thread so the API call returns immediately.
+    Marks the stack restarting and schedules the restart work as a background
+    task so the API call returns immediately.
     """
 
     stack = port_monitor_manager.get_stack(name)
@@ -260,9 +273,9 @@ def restart_stack(name: str = Query(..., description="Stack name")) -> dict[str,
         raise HTTPException(status_code=404, detail="Stack not found")
     # Set status to 'Restarting' and save immediately
     stack.status = "Restarting"
-    port_monitor_manager.save_stacks()
+    await asyncio.to_thread(port_monitor_manager.save_stacks)
     _logger.info("[PortMonitorStackAPI] Stack '%s' status set to 'Restarting'", name)
-    append_ui_event_log(
+    await append_ui_event_log(
         {
             "event": "port_monitor_status",
             "stack": name,
@@ -272,18 +285,17 @@ def restart_stack(name: str = Query(..., description="Stack name")) -> dict[str,
         }
     )
 
-    # Run restart in background
     async def do_restart() -> None:
         """Background worker that performs the restart and subsequent recheck."""
         _logger.info(
-            "[PortMonitorStackAPI] Background restart thread started for stack '%s'",
+            "[PortMonitorStackAPI] Background restart started for stack '%s'",
             name,
         )
-        append_ui_event_log(
+        await append_ui_event_log(
             {
                 "event": "port_monitor_restart_started",
                 "stack": name,
-                "message": f"Background restart thread started for stack '{name}'",
+                "message": f"Background restart started for stack '{name}'",
                 "level": "info",
             }
         )
@@ -292,7 +304,7 @@ def restart_stack(name: str = Query(..., description="Stack name")) -> dict[str,
             "[PortMonitorStackAPI] Restart complete for stack '%s', rechecking status...",
             name,
         )
-        append_ui_event_log(
+        await append_ui_event_log(
             {
                 "event": "port_monitor_restart_complete",
                 "stack": name,
@@ -300,9 +312,9 @@ def restart_stack(name: str = Query(..., description="Stack name")) -> dict[str,
                 "level": "info",
             }
         )
-        port_monitor_manager.recheck_stack(stack.name)
+        await asyncio.to_thread(port_monitor_manager.recheck_stack, stack.name)
         _logger.info("[PortMonitorStackAPI] Status recheck complete for stack '%s'", name)
-        append_ui_event_log(
+        await append_ui_event_log(
             {
                 "event": "port_monitor_status_rechecked",
                 "stack": name,
@@ -311,5 +323,7 @@ def restart_stack(name: str = Query(..., description="Stack name")) -> dict[str,
             }
         )
 
-    threading.Thread(target=lambda: asyncio.run(do_restart()), daemon=True).start()
+    task = asyncio.create_task(do_restart())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     return {"success": True}

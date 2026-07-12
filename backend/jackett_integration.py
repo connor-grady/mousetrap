@@ -48,7 +48,7 @@ async def jackett_login(host: str, port: int, admin_password: str) -> str | None
 
         async with aiohttp.ClientSession(cookie_jar=jar) as session:
             # Step 1: GET /UI/Login to receive TestCookie and Jackett session cookie
-            async with session.get(login_url, allow_redirects=True, timeout=_TIMEOUT) as response:
+            async with session.get(login_url, allow_redirects=True, timeout=_TIMEOUT):
                 # Get all cookies after visiting login page
                 cookies = session.cookie_jar.filter_cookies(URL(build_service_url(host, port)))
 
@@ -153,10 +153,9 @@ async def test_jackett_connection(
                 allow_redirects=False,
             ) as response,
         ):
-            # Check for redirect to login page (authentication required but cookies not working)
-            if response.status == 302:
-                location = response.headers.get("Location", "")
-                if "Login" in location:
+            match response.status:
+                # Redirect to login page means auth is required but cookies aren't working
+                case 302 if "Login" in response.headers.get("Location", ""):
                     if admin_password:
                         # Password was provided but still getting redirect
                         return {
@@ -168,17 +167,19 @@ async def test_jackett_connection(
                         "success": False,
                         "message": "Failed to establish Jackett session. Try entering your admin password if authentication is enabled.",
                     }
-
-            if response.status == 200:
-                indexers = await response.json()
-                auth_status = "authenticated" if admin_password else "no authentication"
-                return {
-                    "success": True,
-                    "message": f"Connected to Jackett successfully ({auth_status})",
-                    "indexer_count": len(indexers) if isinstance(indexers, list) else 0,
-                }
-
-            return {"success": False, "message": f"Jackett API returned status {response.status}"}
+                case 200:
+                    indexers = await response.json()
+                    auth_status = "authenticated" if admin_password else "no authentication"
+                    return {
+                        "success": True,
+                        "message": f"Connected to Jackett successfully ({auth_status})",
+                        "indexer_count": len(indexers) if isinstance(indexers, list) else 0,
+                    }
+                case _:
+                    return {
+                        "success": False,
+                        "message": f"Jackett API returned status {response.status}",
+                    }
 
     except aiohttp.ClientError as e:
         _logger.exception("Jackett connection error")
@@ -194,7 +195,7 @@ async def get_indexer_config(
     api_key: str,
     session_cookie: str | None,
     indexer_name: str = "myanonamouse",
-) -> list | None:
+) -> list[dict[str, Any]] | None:
     """Get indexer configuration from Jackett API.
 
     Args:
@@ -239,7 +240,7 @@ async def update_indexer_config(
     port: int,
     api_key: str,
     session_cookie: str | None,
-    config: list,
+    config: list[dict[str, Any]],
     indexer_name: str = "myanonamouse",
 ) -> bool:
     """Update indexer configuration via Jackett API.
@@ -284,7 +285,7 @@ async def update_indexer_config(
         return False
 
 
-def update_mam_id_in_config(config: list, new_mam_id: str) -> list:
+def update_mam_id_in_config(config: list[dict[str, Any]], new_mam_id: str) -> list[dict[str, Any]]:
     """Update the mam_id field in the configuration array.
 
     Args:

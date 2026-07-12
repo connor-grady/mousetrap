@@ -5,15 +5,15 @@ configuration files, a default global config, and simple helpers used by
 the backend to locate and manage session files.
 """
 
-from os import environ
+import asyncio
 from pathlib import Path
 import threading
 from typing import Any
 
 import yaml
 
-CONFIG_DIR = Path(environ.get("CONFIG_DIR", "/config"))
-CONFIG_PATH = CONFIG_DIR / "config.yaml"
+from backend.paths import CONFIG_DIR, CONFIG_PATH
+
 _LOCK = threading.Lock()
 
 
@@ -30,7 +30,12 @@ def get_session_path(label: str) -> Path:
     return CONFIG_DIR / f"{SESSION_PREFIX}{label}{SESSION_SUFFIX}"
 
 
-def list_sessions() -> list[str]:
+async def list_sessions() -> list[str]:
+    """Return the session labels present in the config directory (I/O offloaded)."""
+    return await asyncio.to_thread(_list_sessions)
+
+
+def _list_sessions() -> list[str]:
     """Return a list of session labels present in the config directory.
 
     Scans the ``CONFIG_DIR`` for files that match the session naming
@@ -59,7 +64,19 @@ def decrypt_password(token: str) -> str:
     return token
 
 
-def load_session(label: str) -> dict[str, Any]:
+def _apply_defaults(parent: dict[str, Any], key: str, defaults: dict[str, Any]) -> None:
+    """Ensure ``parent[key]`` exists and contains every default not already set."""
+    section = parent.setdefault(key, {})
+    for k, v in defaults.items():
+        section.setdefault(k, v)
+
+
+async def load_session(label: str) -> dict[str, Any]:
+    """Load a session configuration by label (I/O offloaded to a worker thread)."""
+    return await asyncio.to_thread(_load_session, label)
+
+
+def _load_session(label: str) -> dict[str, Any]:
     """Load a session configuration by label.
 
     If the session file does not exist the default config is returned. The
@@ -74,42 +91,40 @@ def load_session(label: str) -> dict[str, Any]:
             cfg = yaml.safe_load(f) or get_default_config(label)
     # --- Ensure all perk automation configs are always present and complete ---
     perk_auto = cfg.setdefault("perk_automation", {})
-    # Upload Credit Automation defaults
-    upload_defaults = {
-        "enabled": False,
-        "gb": 1,
-        "min_points": 0,
-        "points_to_keep": 0,
-        "trigger_type": "time",
-        "trigger_days": 7,
-        "trigger_point_threshold": 50000,
-    }
-    upload_auto = perk_auto.setdefault("upload_credit", {})
-    for k, v in upload_defaults.items():
-        upload_auto.setdefault(k, v)
-
-    # Wedge Automation defaults
-    wedge_defaults = {
-        "enabled": False,
-        "trigger_days": 7,
-        "trigger_point_threshold": 50000,
-        "trigger_type": "time",
-    }
-    wedge_auto = perk_auto.setdefault("wedge_automation", {})
-    for k, v in wedge_defaults.items():
-        wedge_auto.setdefault(k, v)
-
-    # VIP Automation defaults
-    vip_defaults = {
-        "enabled": False,
-        "trigger_type": "time",
-        "trigger_days": 7,
-        "trigger_point_threshold": 50000,
-        "weeks": 4,
-    }
-    vip_auto = perk_auto.setdefault("vip_automation", {})
-    for k, v in vip_defaults.items():
-        vip_auto.setdefault(k, v)
+    _apply_defaults(
+        perk_auto,
+        "upload_credit",
+        {
+            "enabled": False,
+            "gb": 1,
+            "min_points": 0,
+            "points_to_keep": 0,
+            "trigger_type": "time",
+            "trigger_days": 7,
+            "trigger_point_threshold": 50000,
+        },
+    )
+    _apply_defaults(
+        perk_auto,
+        "wedge_automation",
+        {
+            "enabled": False,
+            "trigger_days": 7,
+            "trigger_point_threshold": 50000,
+            "trigger_type": "time",
+        },
+    )
+    _apply_defaults(
+        perk_auto,
+        "vip_automation",
+        {
+            "enabled": False,
+            "trigger_type": "time",
+            "trigger_days": 7,
+            "trigger_point_threshold": 50000,
+            "weeks": 4,
+        },
+    )
 
     if "mam_ip" not in cfg:
         cfg["mam_ip"] = ""
@@ -123,17 +138,17 @@ def load_session(label: str) -> dict[str, Any]:
     if "browser_cookie" not in cfg:
         cfg["browser_cookie"] = ""
 
-    # Prowlarr integration defaults
-    prowlarr_defaults = {
-        "enabled": False,
-        "host": "",
-        "port": 9696,
-        "api_key": "",
-        "auto_update_on_save": False,
-    }
-    prowlarr_cfg = cfg.setdefault("prowlarr", {})
-    for k, v in prowlarr_defaults.items():
-        prowlarr_cfg.setdefault(k, v)
+    _apply_defaults(
+        cfg,
+        "prowlarr",
+        {
+            "enabled": False,
+            "host": "",
+            "port": 9696,
+            "api_key": "",
+            "auto_update_on_save": False,
+        },
+    )
 
     # MAM session created date (for 90-day expiry tracking)
     if "mam_session_created_date" not in cfg:
@@ -146,7 +161,12 @@ def load_session(label: str) -> dict[str, Any]:
     return cfg
 
 
-def save_session(cfg: dict, old_label: str | None = None) -> None:
+async def save_session(cfg: dict[str, Any], old_label: str | None = None) -> None:
+    """Persist a session configuration to disk (I/O offloaded to a worker thread)."""
+    await asyncio.to_thread(_save_session, cfg, old_label)
+
+
+def _save_session(cfg: dict[str, Any], old_label: str | None = None) -> None:
     """Persist a session configuration to disk.
 
     If ``old_label`` is provided and different from the new label the
@@ -162,8 +182,7 @@ def save_session(cfg: dict, old_label: str | None = None) -> None:
         old_path = get_session_path(old_label)
         if old_path.exists():
             old_path.rename(path)
-    config_dir = path.parent
-    config_dir.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     # No encryption: just save password as-is
     if "browser_cookie" not in cfg:
         cfg["browser_cookie"] = ""
@@ -193,7 +212,12 @@ def get_default_config(label: str | None = None) -> dict[str, Any]:
     }
 
 
-def load_config() -> dict[str, Any]:
+async def load_config() -> dict[str, Any]:
+    """Load the global default configuration (I/O offloaded to a worker thread)."""
+    return await asyncio.to_thread(_load_config)
+
+
+def _load_config() -> dict[str, Any]:
     """Load the global default configuration from CONFIG_PATH.
 
     If the config file does not exist returns a default config. Ensures a
@@ -213,19 +237,28 @@ def load_config() -> dict[str, Any]:
         return cfg
 
 
-def save_config(cfg: dict[str, Any]) -> None:
+async def save_config(cfg: dict[str, Any]) -> None:
+    """Persist the global configuration (I/O offloaded to a worker thread)."""
+    await asyncio.to_thread(_save_config, cfg)
+
+
+def _save_config(cfg: dict[str, Any]) -> None:
     """Persist the given global configuration to CONFIG_PATH.
 
     Ensures the config directory exists and writes the YAML file.
     """
     # Save to config.yaml (for defaults)
-    config_dir = CONFIG_PATH.parent
-    config_dir.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with _LOCK, CONFIG_PATH.open("w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f)
 
 
-def delete_session(label: str) -> None:
+async def delete_session(label: str) -> None:
+    """Delete the session file for a given label if it exists (I/O offloaded)."""
+    await asyncio.to_thread(_delete_session, label)
+
+
+def _delete_session(label: str) -> None:
     """Delete the session file for a given label if it exists."""
 
     path = get_session_path(label)

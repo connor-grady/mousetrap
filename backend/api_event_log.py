@@ -16,19 +16,19 @@ router = APIRouter()
 
 
 @router.get("/ui_event_log")
-def api_ui_event_log() -> list:
+async def api_ui_event_log() -> list[dict[str, Any]]:
     """Retrieve the UI event log.
 
     Returns:
         The UI event log as returned by backend.event_log.get_ui_event_log().
 
     """
-    return get_ui_event_log()
+    return await get_ui_event_log()
 
 
 # Delete all logs (all sessions)
 @router.delete("/ui_event_log")
-def api_ui_event_log_delete() -> dict[str, Any]:
+async def api_ui_event_log_delete() -> dict[str, Any]:
     """Delete all UI event logs.
 
     Calls backend.event_log.clear_ui_event_log() to remove all logged UI events.
@@ -37,15 +37,14 @@ def api_ui_event_log_delete() -> dict[str, Any]:
         dict: {"success": True} on success, otherwise {"success": False, "error": <message>}.
 
     """
-    success = clear_ui_event_log()
-    if success:
+    if await clear_ui_event_log():
         return {"success": True}
     return {"success": False, "error": "Failed to clear event log."}
 
 
 # Delete logs for a specific session label
 @router.delete("/ui_event_log/{label}")
-def api_ui_event_log_delete_for_session(label: str) -> dict[str, Any]:
+async def api_ui_event_log_delete_for_session(label: str) -> dict[str, Any]:
     """Delete UI event logs for a specific session label.
 
     Calls backend.event_log.clear_ui_event_log_for_session(label) to remove
@@ -58,7 +57,6 @@ def api_ui_event_log_delete_for_session(label: str) -> dict[str, Any]:
         dict: {"success": True} on success, otherwise {"success": False, "error": <message>}.
 
     """
-    success = clear_ui_event_log_for_session(label)
-    if success:
+    if await clear_ui_event_log_for_session(label):
         return {"success": True}
     return {"success": False, "error": f"Failed to clear event log for session '{label}'."}

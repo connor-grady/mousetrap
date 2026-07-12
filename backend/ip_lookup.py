@@ -17,13 +17,13 @@ Public functions:
 """
 
 import logging
-import os
 import time
 from typing import Any
 
 import aiohttp
 
-from backend.utils import build_proxy_dict
+from backend.env import IPDATA_API_KEY, IPINFO_TOKEN
+from backend.utils import build_proxy_dict, redact_proxy_urls
 
 _logger: logging.Logger = logging.getLogger(__name__)
 # Simple cache to prevent duplicate rapid requests (reduce 403 errors)
@@ -34,6 +34,18 @@ _cache_timeout = 300  # Cache for 5 minutes to reduce rate limiting
 _last_cache_log_time: dict[str, float] = {}
 # Minimum seconds between identical cache-hit debug logs per cache key
 _cache_log_min_interval = 60
+
+
+def _format_asn(asn_num: Any, name: str) -> str:
+    """Combine an ASN number (ensuring a single 'AS' prefix) with an org name for display.
+
+    Produces "AS1234 Some Org" when both are present; otherwise the number or name
+    alone (unprefixed, matching provider output), or "" when neither is set.
+    """
+    if asn_num and name:
+        prefix = asn_num if str(asn_num).startswith("AS") else f"AS{asn_num}"
+        return f"{prefix} {name}".strip()
+    return asn_num or name or ""
 
 
 async def get_ipinfo_with_fallback(
@@ -56,62 +68,44 @@ async def get_ipinfo_with_fallback(
             return cached_data
 
     providers = []
-    ipinfo_token = os.environ.get("IPINFO_TOKEN")
-    ipdata_api_key = os.environ.get("IPDATA_API_KEY")
-
     # Common headers for all requests
     headers = {"Accept": "application/json"}
 
     # Strategy: Use the best available provider first based on tokens available
 
     # 1. IPinfo Lite (if token available) - Best data quality and highest limits
-    if ipinfo_token:
+    if IPINFO_TOKEN:
         _logger.debug(
             "[IP Lookup] IPinfo token: ***%s",
-            ipinfo_token[-4:] if len(ipinfo_token) > 4 else "***",
+            IPINFO_TOKEN[-4:] if len(IPINFO_TOKEN) > 4 else "***",
         )
-        if ip:
-            url_ipinfo = f"https://api.ipinfo.io/lite/{ip}"
-        else:
-            url_ipinfo = "https://api.ipinfo.io/lite/me"
+        url_ipinfo = f"https://api.ipinfo.io/lite/{ip or 'me'}"
         headers_ipinfo = headers.copy()
-        headers_ipinfo["Authorization"] = f"Bearer {ipinfo_token}"
+        headers_ipinfo["Authorization"] = f"Bearer {IPINFO_TOKEN}"
         providers.append((url_ipinfo, "ipinfo_lite", headers_ipinfo))
 
     # 2. ipdata.co - Use with API key if available, otherwise free tier
     # Note: Currently experiencing connectivity issues, but keeping in chain
-    if ipdata_api_key:
+    if IPDATA_API_KEY:
         _logger.debug(
             "[IP Lookup] ipdata API key: ***%s",
-            ipdata_api_key[-4:] if len(ipdata_api_key) > 4 else "***",
+            IPDATA_API_KEY[-4:] if len(IPDATA_API_KEY) > 4 else "***",
         )
-        if ip:
-            url_ipdata = f"https://api.ipdata.co/{ip}?api-key={ipdata_api_key}"
-        else:
-            url_ipdata = f"https://api.ipdata.co/?api-key={ipdata_api_key}"
+        url_ipdata = f"https://api.ipdata.co/{ip or ''}?api-key={IPDATA_API_KEY}"
     else:
         _logger.debug(
             "[IP Lookup] No IPDATA_API_KEY set, using ipdata.co free tier (1500 requests/day)"
         )
-        if ip:
-            url_ipdata = f"https://api.ipdata.co/{ip}"
-        else:
-            url_ipdata = "https://api.ipdata.co/"
+        url_ipdata = f"https://api.ipdata.co/{ip or ''}"
     providers.append((url_ipdata, "ipdata", headers))
 
     # 3. ip-api.com - Reliable free provider (HTTP only, may have issues with proxies)
-    if ip:
-        url_ipapi = f"http://ip-api.com/json/{ip}"
-    else:
-        url_ipapi = "http://ip-api.com/json/"
+    url_ipapi = f"http://ip-api.com/json/{ip or ''}"
     providers.append((url_ipapi, "ipapi", headers))
 
     # 4. IPinfo Standard - Good HTTPS fallback without authentication required
     _logger.debug("[IP Lookup] Adding IPinfo Standard API as fallback (1000 requests/month)")
-    if ip:
-        url_ipinfo_std = f"https://ipinfo.io/{ip}/json"
-    else:
-        url_ipinfo_std = "https://ipinfo.io/json"
+    url_ipinfo_std = f"https://ipinfo.io/{ip}/json" if ip else "https://ipinfo.io/json"
     providers.append((url_ipinfo_std, "ipinfo_standard", headers))
 
     # 5. ipify.org - Very reliable HTTPS but IP-only (final fallback to prevent total failure)
@@ -130,15 +124,12 @@ async def get_ipinfo_with_fallback(
         providers.append((url_httpbin, "httpbin_hardcoded", headers))
 
     proxies = build_proxy_dict(proxy_cfg) if proxy_cfg else None
-    if proxies:
-        proxy_label = proxy_cfg.get("label") if proxy_cfg else None
-        proxy_url_log = {
-            k: v.replace(proxy_cfg.get("password", ""), "***")
-            if proxy_cfg and proxy_cfg.get("password")
-            else v
-            for k, v in proxies.items()
-        }
-        _logger.debug("[ip_lookup] Using proxy label: %s, proxies: %s", proxy_label, proxy_url_log)
+    if proxy_cfg and proxies:
+        _logger.debug(
+            "[ip_lookup] Using proxy label: %s, proxies: %s",
+            proxy_cfg.get("label"),
+            redact_proxy_urls(proxies, proxy_cfg),
+        )
 
     timeout = aiohttp.ClientTimeout(total=10)
     proxy_url = None
@@ -158,131 +149,102 @@ async def get_ipinfo_with_fallback(
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for provider_data in providers:
-            url, provider = provider_data[0], provider_data[1]
-            request_headers = provider_data[2] if len(provider_data) > 2 else headers
+            url, provider, request_headers = provider_data
 
             try:
                 # Choose proxy per-request. If multiple proxy schemes are available
                 # we already selected a proxy_url above.
-                resp = await session.get(
+                async with session.get(
                     url, headers=request_headers, proxy=proxy_url, proxy_auth=proxy_auth
-                )
-                if resp.status != 200:
-                    _logger.warning(
-                        "%s lookup failed for IP %s: HTTP %s",
-                        provider,
-                        ip or "self",
-                        resp.status,
-                    )
-                    await resp.release()
-                    continue
-
-                try:
-                    if provider == "httpbin_hardcoded":
-                        # httpbin returns plain text, not JSON
-                        text = await resp.text()
-                        data = {"ip": text.strip()}
-                    else:
-                        data = await resp.json()
-                except Exception as json_e:
-                    _logger.warning(
-                        "%s lookup failed for IP %s: Invalid JSON response - %s",
-                        provider,
-                        ip or "self",
-                        json_e,
-                    )
-                    await resp.release()
-                    continue
-
-                _logger.debug("%s raw response for IP %s: %s", provider, ip or "self", data)
-                _logger.debug("%s lookup successful for IP %s", provider, ip or "self")
-
-                # Normalize output for ipinfo_lite and ipinfo_standard
-                result = None
-                if provider in ("ipinfo_lite", "ipinfo_standard"):
-                    # ipinfo_lite: ip, asn, as_name, as_domain, country_code, country, continent_code, continent
-                    # ipinfo_standard: ip, org, etc.
-                    if provider == "ipinfo_lite":
-                        asn_num = data.get("asn")
-                        as_name = data.get("as_name", "")
-                        # Combine ASN number with name for consistency with other providers
-                        # Check if asn_num already has "AS" prefix to avoid duplication
-                        asn_prefix = asn_num if str(asn_num).startswith("AS") else f"AS{asn_num}"
-                        asn_val = (
-                            f"{asn_prefix} {as_name}".strip()
-                            if asn_num and as_name
-                            else (asn_num or as_name or "")
+                ) as resp:
+                    if resp.status != 200:
+                        _logger.warning(
+                            "%s lookup failed for IP %s: HTTP %s",
+                            provider,
+                            ip or "self",
+                            resp.status,
                         )
-                        org_val = as_name
-                    else:
-                        asn_val = str(data.get("org", ""))
-                        org_val = data.get("org", "")
-                    result = {
-                        "ip": data.get("ip"),
-                        "asn": asn_val,
-                        "org": org_val,
-                        "timezone": data.get(
-                            "timezone", None
-                        ),  # Not present in lite, but included for compatibility
-                    }
-                elif provider == "ipify":
-                    # ipify only returns IP, no ASN data - return None for ASN to indicate unavailable
-                    result = {
-                        "ip": data.get("ip"),
-                        "asn": None,  # Use None instead of "Unknown ASN" to indicate unavailable data
-                        "org": "",
-                        "timezone": None,
-                    }
-                elif provider == "ipinfo_hardcoded":
-                    # ipinfo.io via hardcoded IP (same format as ipinfo_standard)
-                    asn_val = str(data.get("org", ""))
-                    org_val = data.get("org", "")
-                    result = {
-                        "ip": data.get("ip"),
-                        "asn": asn_val,
-                        "org": org_val,
-                        "timezone": data.get("timezone", None),
-                    }
-                elif provider == "httpbin_hardcoded":
-                    # httpbin.org/ip returns just the IP as plain text, handled above
-                    result = {"ip": data.get("ip"), "asn": None, "org": "", "timezone": None}
-                elif provider == "ipapi":
-                    # ipapi returns "as" field which may already contain "AS" prefix
-                    asn_val = str(data.get("as", ""))
-                    result = {
-                        "ip": data.get("query"),
-                        "asn": asn_val,
-                        "org": data.get("org", ""),
-                        "timezone": data.get("timezone", None),
-                    }
-                elif provider == "ipdata":
-                    asn: dict[str, Any] | str | None = data.get("asn", {})
-                    if isinstance(asn, dict):
-                        asn_num = asn.get("asn", "")
-                        asn_name = asn.get("name", "")
-                        # Check if asn_num already has "AS" prefix to avoid duplication
-                        asn_prefix = asn_num if str(asn_num).startswith("AS") else f"AS{asn_num}"
-                        asn_str = (
-                            f"{asn_prefix} {asn_name}".strip()
-                            if asn_num and asn_name
-                            else (asn_num or asn_name or "")
-                        )
-                        org_name = asn_name
-                    else:
-                        asn_str = str(asn) if asn else ""
-                        org_name = ""
-                    result = {
-                        "ip": data.get("ip"),
-                        "asn": asn_str,
-                        "org": org_name,
-                        "timezone": data.get("time_zone", None),
-                    }
+                        continue
 
-                # Cache the successful result
-                if result:
-                    _ip_cache[cache_key] = (result, current_time)
-                    await resp.release()
-                    return result
+                    try:
+                        if provider == "httpbin_hardcoded":
+                            # httpbin returns plain text, not JSON
+                            text = await resp.text()
+                            data = {"ip": text.strip()}
+                        else:
+                            data = await resp.json()
+                    except Exception as json_e:
+                        _logger.warning(
+                            "%s lookup failed for IP %s: Invalid JSON response - %s",
+                            provider,
+                            ip or "self",
+                            json_e,
+                        )
+                        continue
+
+                    _logger.debug("%s raw response for IP %s: %s", provider, ip or "self", data)
+                    _logger.debug("%s lookup successful for IP %s", provider, ip or "self")
+
+                    # Normalize the provider response into a common shape
+                    result = None
+                    match provider:
+                        case "ipinfo_lite" | "ipinfo_standard" | "ipinfo_hardcoded":
+                            # ipinfo_lite: ip, asn, as_name, as_domain, country_code, country, continent_code, continent
+                            # ipinfo_standard / ipinfo_hardcoded: ip, org, etc.
+                            if provider == "ipinfo_lite":
+                                asn_num = data.get("asn")
+                                as_name = data.get("as_name", "")
+                                asn_val = _format_asn(asn_num, as_name)
+                                org_val = as_name
+                            else:
+                                asn_val = str(data.get("org", ""))
+                                org_val = data.get("org", "")
+                            result = {
+                                "ip": data.get("ip"),
+                                "asn": asn_val,
+                                "org": org_val,
+                                "timezone": data.get(
+                                    "timezone", None
+                                ),  # Not present in lite, but included for compatibility
+                            }
+                        case "ipify" | "httpbin_hardcoded":
+                            # IP-only providers (no ASN data); None ASN indicates unavailable data
+                            result = {
+                                "ip": data.get("ip"),
+                                "asn": None,
+                                "org": "",
+                                "timezone": None,
+                            }
+                        case "ipapi":
+                            # ipapi returns "as" field which may already contain "AS" prefix
+                            asn_val = str(data.get("as", ""))
+                            result = {
+                                "ip": data.get("query"),
+                                "asn": asn_val,
+                                "org": data.get("org", ""),
+                                "timezone": data.get("timezone"),
+                            }
+                        case "ipdata":
+                            asn: dict[str, Any] | str | None = data.get("asn", {})
+                            if isinstance(asn, dict):
+                                asn_num = asn.get("asn", "")
+                                asn_name = asn.get("name", "")
+                                asn_str = _format_asn(asn_num, asn_name)
+                                org_name = asn_name
+                            else:
+                                asn_str = str(asn) if asn else ""
+                                org_name = ""
+                            result = {
+                                "ip": data.get("ip"),
+                                "asn": asn_str,
+                                "org": org_name,
+                                "timezone": data.get("time_zone"),
+                            }
+
+                    # Cache the successful result
+                    if result:
+                        _ip_cache[cache_key] = (result, current_time)
+                        return result
 
             except Exception as e:
                 _logger.warning("%s lookup failed for IP %s: %s", provider, ip or "self", e)
@@ -295,30 +257,17 @@ async def get_ipinfo_with_fallback(
     return {"ip": None, "asn": None, "org": "", "timezone": None}
 
 
-async def async_get_public_ip(
-    proxy_cfg: dict[str, Any] | None = None, ipinfo_data: dict[str, Any] | None = None
-) -> str | None:
-    """Async variant returning public IP string or None."""
-    try:
-        data = ipinfo_data or await get_ipinfo_with_fallback(None, proxy_cfg)
-        return data.get("ip")
-    except Exception:
-        return None
-
-
 async def get_asn_and_timezone_from_ip(
     ip: str, proxy_cfg: dict[str, Any] | None = None, ipinfo_data: dict[str, Any] | None = None
 ) -> tuple[str | None, str | None]:
     """Returns (asn, timezone) for the given IP, using provided data or by calling get_ipinfo_with_fallback."""
     try:
         data = ipinfo_data or await get_ipinfo_with_fallback(ip, proxy_cfg)
-        asn = data.get("asn", None)
-        tz = data.get("timezone", None)
     except Exception as e:
         _logger.warning("ASN lookup failed for IP %s: %s", ip, e)
         return None, None
     else:
-        return asn, tz
+        return data.get("asn"), data.get("timezone")
 
 
 async def get_public_ip(

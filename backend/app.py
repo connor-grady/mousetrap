@@ -8,17 +8,18 @@ registration (APScheduler), and related helpers.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-import inspect
 import logging
-import os
-from pathlib import Path
 import re
 import time
-from typing import Any
+from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 import aiohttp
-from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore[import-untyped]
+from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import-untyped]
 from apscheduler.triggers.interval import IntervalTrigger  # type: ignore[import-untyped]
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
@@ -48,12 +49,14 @@ from backend.config import (
     load_session,
     save_session,
 )
+from backend.env import APP_VERSION, TZ
 from backend.event_log import append_ui_event_log, clear_ui_event_log_for_session
 from backend.ip_lookup import get_asn_and_timezone_from_ip, get_ipinfo_with_fallback, get_public_ip
 from backend.jackett_integration import sync_mam_id_to_jackett, test_jackett_connection
 from backend.last_session_api import router as last_session_router, write_last_session
 from backend.mam_api import get_mam_seen_ip_info, get_proxied_public_ip, get_status
 from backend.notifications_backend import notify_event, safe_notify_event
+from backend.paths import ASSETS_DIR, FRONTEND_BUILD_DIR, FRONTEND_PUBLIC_DIR, LOG_DIR
 from backend.port_monitor import port_monitor_manager
 from backend.prowlarr_integration import (
     find_mam_indexer_id,
@@ -61,29 +64,89 @@ from backend.prowlarr_integration import (
     test_prowlarr_connection,
 )
 from backend.proxy_config import resolve_proxy_from_session_cfg
-from backend.utils import build_proxy_dict, build_status_message, extract_asn_number, setup_logging
-
-BASE_DIR = Path(__file__).resolve().parent
-FRONTEND_BUILD_DIR = (Path(BASE_DIR) / "../frontend/build").resolve()
-FRONTEND_PUBLIC_DIR = os.environ.get(
-    "FRONTEND_PUBLIC_DIR", str((Path(BASE_DIR) / "../frontend/public").resolve())
+from backend.utils import (
+    build_proxy_dict,
+    build_status_message,
+    extract_asn_number,
+    redact_proxy_urls,
+    setup_logging,
 )
-
-# Build output directories (Vite puts hashed assets under build/assets)
-ASSETS_DIR = Path(FRONTEND_BUILD_DIR) / "assets"
 
 # Set up global logging configuration
 setup_logging()
 _logger: logging.Logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Manage startup and shutdown for the FastAPI app.
+
+    On startup: initializes APScheduler — resetting check timers, running an
+    initial session sweep, registering all session, automation, and
+    port-monitor jobs, and starting the scheduler.
+    """
+    await reset_all_last_check_times()
+    await run_initial_session_checks()
+
+    # Register all jobs BEFORE starting the scheduler
+    await register_all_session_jobs()
+
+    # Register the automation jobs to run every 10 minutes
+    try:
+        scheduler.add_job(
+            run_all_automation_jobs,
+            trigger=IntervalTrigger(minutes=10),
+            id="automation_jobs",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+        _logger.info("[APScheduler] Registered automation jobs to run every 10 min")
+    except Exception as e:
+        _logger.error("[APScheduler] Failed to register automation jobs: %s", e)
+
+    # Register MAM session expiry check to run daily
+    try:
+        scheduler.add_job(
+            check_mam_session_expiry,
+            trigger=IntervalTrigger(hours=24),
+            id="check_mam_expiry",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
+        _logger.info("[APScheduler] Registered MAM session expiry check to run daily")
+    except Exception as e:
+        _logger.error("[APScheduler] Failed to register MAM expiry check: %s", e)
+
+    # Poll the port-monitor stacks every 5s (blocking docker/socket work is offloaded to a thread)
+    scheduler.add_job(
+        port_monitor_manager.poll,
+        trigger=IntervalTrigger(seconds=5),
+        id="port_monitor",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # Start scheduler AFTER all jobs are registered
+    scheduler.start()
+    _logger.info("[APScheduler] Background scheduler started")
+
+    yield
+
+    # Shutdown: tear down background services in reverse of startup order
+    scheduler.shutdown()
+    _logger.info("[APScheduler] Background scheduler stopped")
+
+
 # FastAPI app creation
-app = FastAPI(title="MouseTrap API")
+app = FastAPI(title="MouseTrap API", lifespan=lifespan)
 
 # Mount static files BEFORE any catch-all routes
 # Serve logs directory as static files for UI event log access
-logs_dir = Path(os.environ.get("LOG_DIR", Path(__file__).parent.parent / "logs"))
-if logs_dir.is_dir():
-    app.mount("/logs", StaticFiles(directory=str(logs_dir)), name="logs")
+if LOG_DIR.is_dir():
+    app.mount("/logs", StaticFiles(directory=str(LOG_DIR)), name="logs")
 
 if ASSETS_DIR.is_dir():
     app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
@@ -102,7 +165,7 @@ app.include_router(notifications_router, prefix="/api")
 app.include_router(port_monitor_router, prefix="/api/port-monitor")
 
 # APScheduler setup
-scheduler = BackgroundScheduler()
+scheduler = AsyncIOScheduler()
 
 session_status_cache: dict[str, Any] = {}
 # Global cache for notification deduplication by UID (MAM account ID)
@@ -183,7 +246,7 @@ def get_auto_update_val(status: dict[str, Any]) -> str:
     for display in the UI or logs. If the value is missing or invalid, returns
     the string "N/A".
     """
-    val = status.get("auto_update_seedbox") if isinstance(status, dict) else None
+    val = status.get("auto_update_seedbox")
     if val is None or val == "" or val is False:
         return "N/A"
     if isinstance(val, dict):
@@ -192,22 +255,31 @@ def get_auto_update_val(status: dict[str, Any]) -> str:
         error = val.get("error")
         if val.get("success") and msg:
             # If reason is present, append it for clarity
-            if reason:
-                return f"{msg} ({reason})"
-            return msg
+            return f"{msg} ({reason})" if reason else msg
         if error:
-            if reason:
-                return f"{error} ({reason})"
-            return error
+            return f"{error} ({reason})" if reason else error
         return "N/A"
     return str(val)
 
 
-async def check_and_notify_count_increments(cfg: dict, new_status: dict, label: str) -> None:
+def _inactive_count(raw: dict[str, Any], key: str) -> int:
+    """Extract the integer ``count`` for an inactivity bucket (``inactHnr``/``inactUnsat``).
+
+    Tolerates missing keys, non-dict buckets, and string counts; returns 0 for
+    anything not coercible to a non-negative integer.
+    """
+    bucket = raw.get(key)
+    value = bucket.get("count", 0) if isinstance(bucket, dict) else 0
+    return int(value) if isinstance(value, int | str) and str(value).isdigit() else 0
+
+
+async def check_and_notify_count_increments(
+    cfg: dict[str, Any], new_status: dict[str, Any]
+) -> None:
     """Check for increments in hit & run and unsatisfied counts and send notifications."""
     # Get the previous status
     old_status = cfg.get("last_status", {})
-    if not isinstance(old_status, dict) or not isinstance(new_status, dict):
+    if not isinstance(old_status, dict):
         return
 
     # Get UID for deduplication (same account across different sessions)
@@ -223,27 +295,8 @@ async def check_and_notify_count_increments(cfg: dict, new_status: dict, label: 
     dedup_key = str(uid) if uid else cfg.get("mam", {}).get("mam_id", "")
 
     # Check inactive hit & run increment
-    old_inact_hnr_raw = (
-        old_raw.get("inactHnr", {}).get("count", 0)
-        if isinstance(old_raw.get("inactHnr"), dict)
-        else 0
-    )
-    new_inact_hnr_raw = (
-        new_raw.get("inactHnr", {}).get("count", 0)
-        if isinstance(new_raw.get("inactHnr"), dict)
-        else 0
-    )
-    # Ensure values are integers for comparison
-    old_inact_hnr = (
-        int(old_inact_hnr_raw)
-        if isinstance(old_inact_hnr_raw, int | str) and str(old_inact_hnr_raw).isdigit()
-        else 0
-    )
-    new_inact_hnr = (
-        int(new_inact_hnr_raw)
-        if isinstance(new_inact_hnr_raw, int | str) and str(new_inact_hnr_raw).isdigit()
-        else 0
-    )
+    old_inact_hnr = _inactive_count(old_raw, "inactHnr")
+    new_inact_hnr = _inactive_count(new_raw, "inactHnr")
 
     if new_inact_hnr > old_inact_hnr:
         increment = new_inact_hnr - old_inact_hnr
@@ -267,27 +320,8 @@ async def check_and_notify_count_increments(cfg: dict, new_status: dict, label: 
             )
 
     # Check inactive unsatisfied increment
-    old_inact_unsat_raw = (
-        old_raw.get("inactUnsat", {}).get("count", 0)
-        if isinstance(old_raw.get("inactUnsat"), dict)
-        else 0
-    )
-    new_inact_unsat_raw = (
-        new_raw.get("inactUnsat", {}).get("count", 0)
-        if isinstance(new_raw.get("inactUnsat"), dict)
-        else 0
-    )
-    # Ensure values are integers for comparison
-    old_inact_unsat = (
-        int(old_inact_unsat_raw)
-        if isinstance(old_inact_unsat_raw, int | str) and str(old_inact_unsat_raw).isdigit()
-        else 0
-    )
-    new_inact_unsat = (
-        int(new_inact_unsat_raw)
-        if isinstance(new_inact_unsat_raw, int | str) and str(new_inact_unsat_raw).isdigit()
-        else 0
-    )
+    old_inact_unsat = _inactive_count(old_raw, "inactUnsat")
+    new_inact_unsat = _inactive_count(new_raw, "inactUnsat")
 
     if new_inact_unsat > old_inact_unsat:
         increment = new_inact_unsat - old_inact_unsat
@@ -311,7 +345,7 @@ async def check_and_notify_count_increments(cfg: dict, new_status: dict, label: 
             )
 
 
-def check_mam_session_expiry() -> None:
+async def check_mam_session_expiry() -> None:
     """Check all sessions for approaching MAM session expiry and send notifications.
 
     This runs daily to check if any sessions with Prowlarr or Chaptarr integration have
@@ -320,10 +354,10 @@ def check_mam_session_expiry() -> None:
     _logger.info("[ExpiryCheck] Checking MAM session expiry for all sessions")
 
     try:
-        sessions = list_sessions()
+        sessions = await list_sessions()
         for label in sessions:
             try:
-                cfg = load_session(label)
+                cfg = await load_session(label)
                 prowlarr_cfg = cfg.get("prowlarr", {})
                 chaptarr_cfg = cfg.get("chaptarr", {})
 
@@ -337,13 +371,7 @@ def check_mam_session_expiry() -> None:
 
                 # Parse the created date
                 try:
-                    # Handle both ISO format with timezone and datetime-local format
-                    if "T" in created_date_str and len(created_date_str) == 16:
-                        # datetime-local format: YYYY-MM-DDTHH:MM
-                        created_date = datetime.fromisoformat(created_date_str)
-                    else:
-                        # ISO format with timezone
-                        created_date = datetime.fromisoformat(created_date_str)
+                    created_date = datetime.fromisoformat(created_date_str)
                 except (ValueError, AttributeError) as e:
                     _logger.warning(
                         "[ExpiryCheck] Invalid date format for session '%s': %s", label, e
@@ -352,7 +380,7 @@ def check_mam_session_expiry() -> None:
 
                 # Calculate expiry (30 days from creation)
                 expiry_date = created_date + timedelta(days=30)
-                days_until_expiry = (expiry_date - datetime.now()).days
+                days_until_expiry = (expiry_date - datetime.now(UTC)).days
 
                 # Check if we should notify - use the session-level setting
                 notify_days = cfg.get("notify_before_expiry_days", 7)
@@ -407,15 +435,13 @@ def check_mam_session_expiry() -> None:
                         else "N/A",
                     }
 
-                    # Send notification asynchronously
-                    asyncio.run(
-                        notify_event(
-                            event_type="mam_session_expiry",
-                            label=label,
-                            status="WARNING",
-                            message=message,
-                            details=details,
-                        )
+                    # Send notification
+                    await notify_event(
+                        event_type="mam_session_expiry",
+                        label=label,
+                        status="WARNING",
+                        message=message,
+                        details=details,
                     )
 
                 elif days_until_expiry < 0:
@@ -432,62 +458,8 @@ def check_mam_session_expiry() -> None:
         _logger.error("[ExpiryCheck] Error in MAM expiry check: %s", e)
 
 
-# Start PortMonitorStackManager monitor loop on FastAPI startup
-@app.on_event("startup")  # type: ignore[deprecated]
-def start_port_monitor_manager() -> None:
-    """Start the PortMonitor manager when the FastAPI app starts.
-
-    This triggers the background monitoring loop for configured port monitor
-    stacks so that their status is kept up-to-date.
-    """
-    port_monitor_manager.start()
-
-
-# Initialize APScheduler on FastAPI startup
-@app.on_event("startup")  # type: ignore[deprecated]
-async def initialize_scheduler() -> None:
-    """Initialize APScheduler and register all session jobs on startup."""
-    reset_all_last_check_times()
-    await run_initial_session_checks()
-
-    # Register all jobs BEFORE starting the scheduler
-    register_all_session_jobs()
-
-    # Register the automation jobs to run every 10 minutes
-    try:
-        scheduler.add_job(
-            sync_automation_jobs,
-            trigger=IntervalTrigger(minutes=10),
-            id="automation_jobs",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
-        _logger.info("[APScheduler] Registered automation jobs to run every 10 min")
-    except Exception as e:
-        _logger.error("[APScheduler] Failed to register automation jobs: %s", e)
-
-    # Register MAM session expiry check to run daily
-    try:
-        scheduler.add_job(
-            check_mam_session_expiry,
-            trigger=IntervalTrigger(hours=24),
-            id="check_mam_expiry",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
-        _logger.info("[APScheduler] Registered MAM session expiry check to run daily")
-    except Exception as e:
-        _logger.error("[APScheduler] Failed to register MAM expiry check: %s", e)
-
-    # Start scheduler AFTER all jobs are registered
-    scheduler.start()
-    _logger.info("[APScheduler] Background scheduler started")
-
-
 @app.get("/api/automation/guardrails")
-def api_automation_guardrails() -> dict[str, Any]:
+async def api_automation_guardrails() -> dict[str, Any]:
     """Returns a mapping of session labels to MaM usernames and enabled automations for guardrail logic.
 
     Example:
@@ -497,12 +469,11 @@ def api_automation_guardrails() -> dict[str, Any]:
         }
 
     """
-    sessions = list_sessions()
+    sessions = await list_sessions()
     result: dict[str, Any] = {}
     for label in sessions:
-        cfg = load_session(label)
+        cfg = await load_session(label)
         # Try to get username from last_status.raw.username
-        username = None
         last_status = cfg.get("last_status", {})
         raw = last_status.get("raw", {})
         username = raw.get("username")
@@ -541,9 +512,9 @@ async def keepalive_mam_session(cfg: dict[str, Any], label: str, now: datetime) 
         _logger.warning("[Keepalive] label=%s No mam_id; skipping keepalive.", label)
         return False
 
-    proxy_cfg = resolve_proxy_from_session_cfg(cfg)
+    proxy_cfg = await resolve_proxy_from_session_cfg(cfg)
     proxies = build_proxy_dict(proxy_cfg) if proxy_cfg else None
-    proxy_url = (proxies.get("https") or proxies.get("http")) if isinstance(proxies, dict) else None
+    proxy_url = (proxies.get("https") or proxies.get("http")) if proxies else None
 
     try:
         timeout = aiohttp.ClientTimeout(total=10)
@@ -562,9 +533,7 @@ async def keepalive_mam_session(cfg: dict[str, Any], label: str, now: datetime) 
                 text = await resp.text()
                 result = {"msg": text[:200]}
 
-            if status_code == 429 or (
-                isinstance(result.get("msg"), str) and "too recent" in result.get("msg", "")
-            ):
+            if status_code == 429 or ("too recent" in str(result.get("msg", ""))):
                 # Rate-limited — MAM still received the request; counts as keepalive activity
                 _logger.info(
                     "[Keepalive] label=%s Rate-limited (429) — session activity confirmed.", label
@@ -582,7 +551,7 @@ async def keepalive_mam_session(cfg: dict[str, Any], label: str, now: datetime) 
                     status_code,
                     result.get("msg", ""),
                 )
-                append_ui_event_log(
+                await append_ui_event_log(
                     {
                         "timestamp": now.isoformat(),
                         "label": label,
@@ -594,7 +563,7 @@ async def keepalive_mam_session(cfg: dict[str, Any], label: str, now: datetime) 
 
     except Exception as e:
         _logger.warning("[Keepalive] label=%s Network error during keepalive: %s", label, e)
-        append_ui_event_log(
+        await append_ui_event_log(
             {
                 "timestamp": now.isoformat(),
                 "label": label,
@@ -607,10 +576,10 @@ async def keepalive_mam_session(cfg: dict[str, Any], label: str, now: datetime) 
     # Update keepalive timestamp and reset the session creation date so the
     # expiry notification timer reflects this confirmed activity.
     try:
-        fresh_cfg = load_session(label)
+        fresh_cfg = await load_session(label)
         fresh_cfg["last_mam_keepalive"] = now.isoformat()
         fresh_cfg["mam_session_created_date"] = now.isoformat()
-        save_session(fresh_cfg, old_label=label)
+        await save_session(fresh_cfg, old_label=label)
         _logger.info(
             "[Keepalive] label=%s Updated last_mam_keepalive and reset mam_session_created_date.",
             label,
@@ -620,6 +589,22 @@ async def keepalive_mam_session(cfg: dict[str, Any], label: str, now: datetime) 
         # Non-fatal — the network call succeeded
 
     return True
+
+
+async def _persist_seedbox_ip(
+    cfg: dict[str, Any], label: str, asn: str | None, now: datetime
+) -> str | None:
+    """Record a successful seedbox IP/ASN update on ``cfg`` and persist it; returns the new IP."""
+    new_ip = cfg.get("proxied_public_ip") or await get_public_ip()
+    cfg["last_seedbox_ip"] = new_ip
+    cfg["mam_ip"] = new_ip
+    cfg["last_seedbox_update"] = now.isoformat()
+    cfg["last_seedbox_asn"] = asn
+    try:
+        await save_session(cfg, old_label=label)
+    except Exception as e:
+        _logger.error("[AutoUpdate][ERROR] label=%s save_session failed: %s", label, e)
+    return new_ip
 
 
 async def auto_update_seedbox_if_needed(
@@ -651,10 +636,8 @@ async def auto_update_seedbox_if_needed(
     update_needed = False
     reason: str | None = None
     # Remove all IP logic for the API call; only use mam_id and proxy
-    proxy_cfg = resolve_proxy_from_session_cfg(cfg)
-    proxies = None
-    if proxy_cfg:
-        proxies = build_proxy_dict(proxy_cfg)
+    proxy_cfg = await resolve_proxy_from_session_cfg(cfg)
+    proxies = build_proxy_dict(proxy_cfg) if proxy_cfg else None
     # Do not log proxies dict (may contain sensitive info)
     # Only trigger update if something changed (IP or ASN)
 
@@ -662,7 +645,6 @@ async def auto_update_seedbox_if_needed(
     if session_type == "asn locked":
         # Always get ASN using proxy if available
         proxied_ip = cfg.get("proxied_public_ip")
-        proxy_cfg = resolve_proxy_from_session_cfg(cfg)
         asn_to_check, _ = await get_asn_and_timezone_from_ip(
             proxied_ip or ip_to_use, proxy_cfg if proxied_ip else None
         )
@@ -677,11 +659,11 @@ async def auto_update_seedbox_if_needed(
             # Continue with normal processing without ASN change detection
         else:
             norm_last = extract_asn_number(last_seedbox_asn) if last_seedbox_asn else None
-            norm_check = extract_asn_number(asn_to_check) if "asn_to_check" in locals() else None
+            norm_check = extract_asn_number(asn_to_check)
             # Always store the normalized ASN number if available
             if norm_check is not None:
                 cfg["last_seedbox_asn"] = norm_check
-                save_session(cfg, old_label=label)
+                await save_session(cfg, old_label=label)
             # Log ASN compare and result at INFO level
             if norm_last != norm_check:
                 reason = f"ASN changed: {norm_last} -> {norm_check}"
@@ -702,12 +684,8 @@ async def auto_update_seedbox_if_needed(
                 )
     # For proxied sessions, use proxied IP; for non-proxied, use detected public IP
     proxied_ip = cfg.get("proxied_public_ip")
-    if proxied_ip:
-        ip_to_check = proxied_ip
-    else:
-        # For non-proxied, get detected public IP (not mam_ip)
-        detected_ip = await get_public_ip()
-        ip_to_check = detected_ip
+    # For non-proxied, get detected public IP (not mam_ip)
+    ip_to_check = proxied_ip or await get_public_ip()
     # If IP lookup failed, skip config update and logging
     if ip_to_check is None:
         _logger.warning(
@@ -758,7 +736,7 @@ async def auto_update_seedbox_if_needed(
             )
             cookies = {"mam_id": mam_id}
             proxy_url = None
-            if proxies and isinstance(proxies, dict):
+            if proxies:
                 proxy_url = proxies.get("https") or proxies.get("http")
 
             timeout = aiohttp.ClientTimeout(total=10)
@@ -792,29 +770,13 @@ async def auto_update_seedbox_if_needed(
 
                 if resp.status == 200 and result.get("Success"):
                     # Update last_seedbox_ip and mam_ip to the new detected/proxied IP
-                    proxied_ip = cfg.get("proxied_public_ip")
-                    if proxied_ip:
-                        new_ip = proxied_ip
-                    else:
-                        new_ip = await get_public_ip()
-                    cfg["last_seedbox_ip"] = new_ip
-                    cfg["mam_ip"] = new_ip
-                    cfg["last_seedbox_update"] = now.isoformat()
-                    cfg["last_seedbox_asn"] = asn
-                    try:
-                        save_session(cfg, old_label=label)
-                    except Exception as e:
-                        _logger.error(
-                            "[AutoUpdate][ERROR] label=%s save_session failed: %s",
-                            label,
-                            e,
-                        )
+                    new_ip = await _persist_seedbox_ip(cfg, label, asn, now)
                     _logger.info(
                         "[AutoUpdate] label=%s result=success reason=%s",
                         label,
                         reason,
                     )
-                    api_msg = result.get("msg", "").strip()
+                    api_msg = str(result.get("msg", "")).strip()
                     if not api_msg or api_msg.lower() == "completed":
                         api_msg = "IP Changed. Seedbox IP updated."
                     await safe_notify_event(
@@ -826,21 +788,7 @@ async def auto_update_seedbox_if_needed(
                     )
                     return True, {"success": True, "msg": api_msg, "reason": reason}
                 if resp.status == 200 and result.get("msg") == "No change":
-                    proxied_ip = cfg.get("proxied_public_ip")
-                    if proxied_ip:
-                        new_ip = proxied_ip
-                    else:
-                        new_ip = await get_public_ip()
-                    cfg["last_seedbox_ip"] = new_ip
-                    cfg["mam_ip"] = new_ip
-                    cfg["last_seedbox_update"] = now.isoformat()
-                    cfg["last_seedbox_asn"] = asn
-                    try:
-                        save_session(cfg, old_label=label)
-                    except Exception as e:
-                        _logger.error(
-                            "[AutoUpdate][ERROR] label=%s save_session failed: %s", label, e
-                        )
+                    await _persist_seedbox_ip(cfg, label, asn, now)
                     _logger.info(
                         "[AutoUpdate] label=%s result=no_change reason=%s",
                         label,
@@ -851,9 +799,7 @@ async def auto_update_seedbox_if_needed(
                         "msg": "No change: IP/ASN already set.",
                         "reason": reason,
                     }
-                if resp.status == 429 or (
-                    isinstance(result.get("msg"), str) and "too recent" in result.get("msg", "")
-                ):
+                if resp.status == 429 or ("too recent" in str(result.get("msg", ""))):
                     # Do NOT update last_seedbox_ip or mam_ip if rate-limited; return rate-limit info for UI
                     rate_limit_minutes = 60
                     if last_seedbox_update:
@@ -886,7 +832,7 @@ async def auto_update_seedbox_if_needed(
                 )
 
                 # Check if this is an ASN mismatch issue for ASN Locked sessions
-                error_msg = result.get("msg", "Unknown error")
+                error_msg = str(result.get("msg", "Unknown error"))
                 if session_type == "asn locked" and (
                     "Invalid session" in error_msg or resp.status == 403
                 ):
@@ -973,26 +919,28 @@ async def auto_update_seedbox_if_needed(
 
 
 @app.get("/api/status")
-async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[str, Any]:
+async def api_status(
+    label: Annotated[str | None, Query()] = None, force: Annotated[int, Query()] = 0
+) -> dict[str, Any]:
     """Return the current status for a session label.
 
     If `force` is truthy, a fresh status check is performed even if a cached
     value exists. The returned dict contains status details expected by the
     frontend UI.
     """
-    global session_status_cache
     # Single API call for non-proxied IP/ASN detection (efficiency optimization)
     detected_ipinfo_data = await get_ipinfo_with_fallback()
     detected_public_ip = detected_ipinfo_data.get("ip")
     detected_public_ip_asn = None
+    detected_public_ip_as = None
     if detected_public_ip:
         asn_full_pub = detected_ipinfo_data.get("asn")
-        match_pub = re.search(r"(AS)?(\d+)", asn_full_pub or "") if asn_full_pub else None
-        detected_public_ip_asn = match_pub.group(2) if match_pub else asn_full_pub
+        detected_public_ip_asn = extract_asn_number(asn_full_pub) or asn_full_pub
+        detected_public_ip_as = asn_full_pub
 
-    cfg = load_session(label) if label else None
+    cfg = await load_session(label) if label else None
     if cfg is None:
-        available = list_sessions()
+        available = await list_sessions()
         if label is None:
             _logger.debug("No session label provided to status endpoint.")
             status_message = (
@@ -1018,7 +966,7 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
             "detected_public_ip_asn": detected_public_ip_asn,
         }
     # Proxied public IP/ASN detection (single API call optimization)
-    proxy_cfg = resolve_proxy_from_session_cfg(cfg)
+    proxy_cfg = await resolve_proxy_from_session_cfg(cfg)
     proxied_public_ip, proxied_public_ip_asn, proxied_public_ip_as = None, None, None
     proxy_error = None
     if proxy_cfg and proxy_cfg.get("host"):
@@ -1028,14 +976,13 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
             proxied_public_ip = proxied_ipinfo_data.get("ip")
             asn_full_proxied = proxied_ipinfo_data.get("asn")
             asn_str = str(asn_full_proxied) if asn_full_proxied is not None else ""
-            match_proxied = re.search(r"(AS)?(\d+)", asn_str) if asn_str else None
-            proxied_public_ip_asn = match_proxied.group(2) if match_proxied else asn_str
+            proxied_public_ip_asn = extract_asn_number(asn_str) or asn_str
             proxied_public_ip_as = asn_full_proxied
             # Save to config if changed
             if proxied_public_ip and cfg.get("proxied_public_ip") != proxied_public_ip:
                 cfg["proxied_public_ip"] = proxied_public_ip
                 cfg["proxied_public_ip_asn"] = proxied_public_ip_asn
-                save_session(cfg, old_label=label)
+                await save_session(cfg, old_label=label)
         except Exception as e:
             proxy_error = f"Proxy/VPN connection failed: {e!s}"
 
@@ -1050,7 +997,7 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
     elif cfg.get("proxied_public_ip") or cfg.get("proxied_public_ip_asn"):
         cfg["proxied_public_ip"] = None
         cfg["proxied_public_ip_asn"] = None
-        save_session(cfg, old_label=label)
+        await save_session(cfg, old_label=label)
     if not label:
         # Always return detected_public_ip and asn, even if label is missing
         return {
@@ -1063,7 +1010,7 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
             "detected_public_ip_asn": detected_public_ip_asn,
         }
     # Always reload session config before every check to ensure latest proxy settings
-    cfg = load_session(label)
+    cfg = await load_session(label)
     mam_id = cfg.get("mam", {}).get("mam_id", "")
     mam_ip_override = cfg.get("mam_ip", "").strip()
     ip_monitoring_mode = cfg.get("mam", {}).get("ip_monitoring_mode", "auto")
@@ -1072,7 +1019,7 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
     # Only the monitoring/auto-update logic differs between modes
 
     # Always resolve proxy config immediately before every get_status call
-    proxy_cfg = resolve_proxy_from_session_cfg(cfg)
+    proxy_cfg = await resolve_proxy_from_session_cfg(cfg)
     # If session is not configured (no mam_id), return not configured status
     if not mam_id:
         return {
@@ -1088,29 +1035,17 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
     ip_to_use: str | None = mam_ip_override or proxied_public_ip or detected_public_ip
     # Get ASN for configured IP
     asn_full, _ = await get_asn_and_timezone_from_ip(ip_to_use) if ip_to_use else (None, None)
-    match = re.search(r"(AS)?(\d+)", asn_full or "") if asn_full else None
-    asn = match.group(2) if match else asn_full
+    asn = extract_asn_number(asn_full) or asn_full
     mam_session_as = asn_full
     # Also get MAM's perspective for display only
     mam_seen = await get_mam_seen_ip_info(mam_id, proxy_cfg=proxy_cfg or {})
     mam_seen_asn = str(mam_seen.get("ASN")) if mam_seen.get("ASN") is not None else None
     mam_seen_as = mam_seen.get("AS")
-    tz_env = os.environ.get("TZ")
-    timezone_used = tz_env if tz_env else "UTC"
     now = datetime.now(UTC)
     # Remove timer persistence: do not use session file for last_check_time
     cache = session_status_cache.get(label, {})
     status = cache.get("status", {})
     last_check_time = cache.get("last_check_time")
-    auto_update_result = None
-    # Always fetch ASN for detected_public_ip
-    detected_public_ip_asn = None
-    detected_public_ip_as = None
-    if detected_public_ip:
-        asn_full_pub, _ = await get_asn_and_timezone_from_ip(detected_public_ip)
-        match_pub = re.search(r"(AS)?(\d+)", asn_full_pub or "") if asn_full_pub else None
-        detected_public_ip_asn = match_pub.group(2) if match_pub else asn_full_pub
-        detected_public_ip_as = asn_full_pub
     # If session has never been checked (no last_status and not forced), return not configured
     if not force and (
         label not in session_status_cache or not session_status_cache[label].get("status")
@@ -1126,10 +1061,41 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
                 "details": {},
             }
 
+    def _status_payload(
+        *, next_check_time: str | None, status_message: Any, **extra: Any
+    ) -> dict[str, Any]:
+        """Assemble the /api/status response body shared by the cached and fresh-check paths."""
+        return {
+            "mam_cookie_exists": status.get("mam_cookie_exists"),
+            "points": status.get("points"),
+            "wedge_active": status.get("wedge_active"),
+            "vip_active": status.get("vip_active"),
+            "current_ip": ip_to_use,
+            "current_ip_asn": asn,
+            "mam_session_as": mam_session_as,
+            "mam_seen_asn": mam_seen_asn,
+            "mam_seen_as": mam_seen_as,
+            "configured_ip": ip_to_use,
+            "configured_asn": asn,
+            "check_freq": check_freq_minutes,
+            "last_check_time": last_check_time,
+            "next_check_time": next_check_time,
+            "status_message": status_message,
+            "details": status,
+            "detected_public_ip": detected_public_ip,
+            "detected_public_ip_asn": detected_public_ip_asn,
+            "detected_public_ip_as": detected_public_ip_as,
+            "proxied_public_ip": proxied_public_ip,
+            "proxied_public_ip_asn": proxied_public_ip_asn,
+            "proxied_public_ip_as": proxied_public_ip_as,
+            "ip_monitoring_mode": ip_monitoring_mode,
+            **extra,
+        }
+
     # If we have cached data and not forcing, use it and calculate next_check_time
     if not force and status:
         # Use cached data with calculated timing
-        check_freq_minutes = cfg.get("check_freq", 15)
+        check_freq_minutes = cfg.get("check_freq", 5)
         if last_check_time:
             try:
                 last_check_dt = datetime.fromisoformat(last_check_time)
@@ -1144,102 +1110,77 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
             next_check_time = next_check_dt.isoformat()
 
         # Return cached status with calculated timing
-        return {
-            "mam_cookie_exists": status.get("mam_cookie_exists"),
-            "points": status.get("points"),
-            "wedge_active": status.get("wedge_active"),
-            "vip_active": status.get("vip_active"),
-            "current_ip": ip_to_use,
-            "current_ip_asn": asn,
-            "mam_session_as": mam_session_as,
-            "mam_seen_asn": mam_seen_asn,
-            "mam_seen_as": mam_seen_as,
-            "configured_ip": ip_to_use,
-            "configured_asn": asn,
-            "mam_id": mam_id,
-            "check_freq": check_freq_minutes,
-            "last_check_time": last_check_time,
-            "next_check_time": next_check_time,
-            "configured": True,
-            "status_message": status.get("status_message", "OK"),
-            "auto_update_seedbox": status.get("auto_update_seedbox"),
-            "details": status,
-            "detected_public_ip": detected_public_ip,
-            "detected_public_ip_asn": detected_public_ip_asn,
-            "detected_public_ip_as": detected_public_ip_as,
-            "proxied_public_ip": proxied_public_ip,
-            "proxied_public_ip_asn": proxied_public_ip_asn,
-            "proxied_public_ip_as": proxied_public_ip_as,
-            "ip_monitoring_mode": ip_monitoring_mode,
-        }
-
-    if force or not status:
-        # Always reload session config and resolve proxy before every real check
-        cfg = load_session(label)
-        proxy_cfg = resolve_proxy_from_session_cfg(cfg)
-        # Always perform a fresh status check and update both cache and YAML
-        _logger.debug(
-            "[SessionCheck][TRIGGER] label=%s source=%s",
-            label,
-            "forced_api_status" if force else "auto_api_status",
+        return _status_payload(
+            next_check_time=next_check_time,
+            status_message=status.get("status_message", "OK"),
+            mam_id=mam_id,
+            configured=True,
+            auto_update_seedbox=status.get("auto_update_seedbox"),
         )
-        mam_status = await get_status(mam_id=mam_id, proxy_cfg=proxy_cfg)
-        # Persist refreshed cookie immediately so the reload below picks it up
-        _refreshed_mam_id = mam_status.pop("updated_mam_id", None)
-        if _refreshed_mam_id and _refreshed_mam_id != mam_id:
-            _prev_mam_id = mam_id
-            mam_id = _refreshed_mam_id
-            cfg["mam"]["mam_id"] = _refreshed_mam_id
-            save_session(cfg, old_label=label)
-            _logger.info("[SessionCheck] mam_id cookie auto-refreshed for session '%s'", label)
-            await _sync_integrations_if_mam_id_changed(cfg, label, mam_id, _prev_mam_id)
-        if "proxy_error" not in mam_status and "proxy_error" in locals() and proxy_error:
-            mam_status["proxy_error"] = proxy_error
-        mam_status["configured_ip"] = ip_to_use
-        mam_status["configured_asn"] = asn
-        mam_status["mam_seen_asn"] = mam_seen_asn
-        mam_status["mam_seen_as"] = mam_seen_as
-        # Auto-update logic
-        # Skip auto-update for static/manual modes since they don't need IP monitoring
-        if ip_monitoring_mode == "auto":
-            auto_update_triggered, auto_update_result = await auto_update_seedbox_if_needed(
-                cfg, label, ip_to_use, asn, now
-            )
-        else:
-            auto_update_triggered, auto_update_result = False, None
-            _logger.debug(
-                "[Status] Skipping auto-update for session '%s' in %s mode",
-                label,
-                ip_monitoring_mode,
-            )
 
-        if auto_update_triggered and auto_update_result:
-            mam_status["auto_update_seedbox"] = auto_update_result
-            # Always persist the correct status_message after an update
-            if auto_update_result.get("error"):
-                mam_status["status_message"] = auto_update_result.get("error")
-            elif auto_update_result.get("success") is True and (
-                auto_update_result.get("msg") or auto_update_result.get("reason")
-            ):
-                mam_status["status_message"] = auto_update_result.get(
-                    "msg"
-                ) or auto_update_result.get("reason")
-            else:
-                mam_status["status_message"] = build_status_message(mam_status, ip_monitoring_mode)
+    # Always perform a fresh status check and update both cache and YAML.
+    # cfg/proxy_cfg from above are still current — nothing has written the session file since.
+    _logger.debug(
+        "[SessionCheck][TRIGGER] label=%s source=%s",
+        label,
+        "forced_api_status" if force else "auto_api_status",
+    )
+    mam_status = await get_status(mam_id=mam_id, proxy_cfg=proxy_cfg)
+    # Persist refreshed cookie immediately so the reload below picks it up
+    _refreshed_mam_id = mam_status.pop("updated_mam_id", None)
+    if _refreshed_mam_id and _refreshed_mam_id != mam_id:
+        _prev_mam_id = mam_id
+        mam_id = _refreshed_mam_id
+        cfg["mam"]["mam_id"] = _refreshed_mam_id
+        await save_session(cfg, old_label=label)
+        _logger.info("[SessionCheck] mam_id cookie auto-refreshed for session '%s'", label)
+        await _sync_integrations_if_mam_id_changed(cfg, label, mam_id, _prev_mam_id)
+    if "proxy_error" not in mam_status and proxy_error:
+        mam_status["proxy_error"] = proxy_error
+    mam_status["configured_ip"] = ip_to_use
+    mam_status["configured_asn"] = asn
+    mam_status["mam_seen_asn"] = mam_seen_asn
+    mam_status["mam_seen_as"] = mam_seen_as
+    # Auto-update logic
+    # Skip auto-update for static/manual modes since they don't need IP monitoring
+    if ip_monitoring_mode == "auto":
+        auto_update_triggered, auto_update_result = await auto_update_seedbox_if_needed(
+            cfg, label, ip_to_use, asn, now
+        )
+    else:
+        auto_update_triggered, auto_update_result = False, None
+        _logger.debug(
+            "[Status] Skipping auto-update for session '%s' in %s mode",
+            label,
+            ip_monitoring_mode,
+        )
+
+    if auto_update_triggered and auto_update_result:
+        mam_status["auto_update_seedbox"] = auto_update_result
+        # Always persist the correct status_message after an update
+        if auto_update_result.get("error"):
+            mam_status["status_message"] = auto_update_result.get("error")
+        elif auto_update_result.get("success") is True and (
+            auto_update_result.get("msg") or auto_update_result.get("reason")
+        ):
+            mam_status["status_message"] = auto_update_result.get("msg") or auto_update_result.get(
+                "reason"
+            )
         else:
             mam_status["status_message"] = build_status_message(mam_status, ip_monitoring_mode)
-        # Update in-memory cache and YAML file with the latest status
-        session_status_cache[label] = {"status": mam_status, "last_check_time": now.isoformat()}
-        status = mam_status
-        last_check_time = now.isoformat()
-        # Reload config from disk to ensure latest values (e.g., last_seedbox_ip) are used
-        cfg = load_session(label)
-        # Check for increments in hit & run and unsatisfied counts before saving new status
-        await check_and_notify_count_increments(cfg, status, label)
-        # Save last status to session file
-        cfg["last_status"] = status
-        cfg["last_check_time"] = last_check_time
-        save_session(cfg, old_label=label)
+    else:
+        mam_status["status_message"] = build_status_message(mam_status, ip_monitoring_mode)
+    # Update in-memory cache and YAML file with the latest status
+    session_status_cache[label] = {"status": mam_status, "last_check_time": now.isoformat()}
+    status = mam_status
+    last_check_time = now.isoformat()
+    # cfg already holds the in-place updates from the mam_id refresh and auto-update above.
+    # Check for increments in hit & run and unsatisfied counts before saving new status
+    await check_and_notify_count_increments(cfg, status)
+    # Save last status to session file
+    cfg["last_status"] = status
+    cfg["last_check_time"] = last_check_time
+    await save_session(cfg, old_label=label)
     # If not force and status exists, do NOT update last_check_time or next_check_time; use cached values
 
     # Only log an event if a real check was performed (force=1 or no cached status),
@@ -1249,7 +1190,6 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
     if label in session_status_cache and session_status_cache[label].get("suppress_next_event"):
         suppress_next_event = True
         session_status_cache[label].pop("suppress_next_event", None)
-    just_created_session = False
     try:
         just_created_session = not bool(cfg.get("last_status")) and not bool(
             cfg.get("last_check_time")
@@ -1261,7 +1201,6 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
         and not just_created_session
         and not suppress_next_event
     ):
-        safe_status = status if isinstance(status, dict) else {}
         prev_ip = cfg.get("last_seedbox_ip")
         prev_asn = cfg.get("last_seedbox_asn")
         proxied_ip = cfg.get("proxied_public_ip")
@@ -1269,25 +1208,19 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
         detected_ip = detected_public_ip
         curr_ip = mam_ip_override or proxied_ip or detected_ip
         asn_full, _ = await get_asn_and_timezone_from_ip(curr_ip) if curr_ip else (None, None)
-        match = re.search(r"(AS)?(\d+)", asn_full or "") if asn_full else None
-        curr_asn = match.group(2) if match else asn_full
+        curr_asn = extract_asn_number(asn_full) or asn_full
 
         # Handle None ASN gracefully - if we can't determine ASN, preserve previous value for comparison
         if curr_asn is None or curr_asn == "Unknown ASN":
             curr_asn = prev_asn  # Use previous ASN to avoid false change notifications
 
-        event_status_message = None
-        error_val = (
-            auto_update_result.get("error")
-            if (auto_update_result and isinstance(auto_update_result, dict))
-            else None
-        )
+        error_val = auto_update_result.get("error") if (auto_update_result) else None
         # If rate limit, show attempted new IP/ASN in event log
         if error_val and isinstance(error_val, str) and "rate limit" in error_val.lower():
             event_status_message = error_val
             attempted_ip = None
             attempted_asn = None
-            if auto_update_result and isinstance(auto_update_result, dict):
+            if auto_update_result:
                 reason = auto_update_result.get("reason", "")
                 ip_match = re.search(r"IP changed: ([^ ]+) -> ([^ ]+)", reason)
                 asn_match = re.search(r"ASN changed: ([^ ]+) -> ([^ ]+)", reason)
@@ -1302,7 +1235,7 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
             event_ip_compare = f"{prev_ip} -> {attempted_ip}"
             event_asn_compare = f"{prev_asn} -> {attempted_asn}"
         else:
-            event_status_message = build_status_message(safe_status, ip_monitoring_mode)
+            event_status_message = build_status_message(status, ip_monitoring_mode)
             event_ip_compare = f"{prev_ip} -> {curr_ip}"
             event_asn_compare = f"{prev_asn} -> {curr_asn}"
         # Determine event type
@@ -1313,7 +1246,7 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
         else:
             event_type = "scheduled"
         # All variables are defined in this scope, so log event here
-        auto_update_val = get_auto_update_val(safe_status)
+        auto_update_val = get_auto_update_val(status)
         event = {
             "timestamp": now.isoformat(),
             "label": label,
@@ -1331,17 +1264,16 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
                     or "IP Changed. Seedbox IP updated."
                 )
                 if auto_update_result
-                and isinstance(auto_update_result, dict)
-                and auto_update_result.get("success") is True
+                and auto_update_result.get("success")
                 and (auto_update_result.get("msg") or auto_update_result.get("reason"))
                 else status.get("status_message")
                 or event_status_message
                 or build_status_message(status)
             ),
         }
-        append_ui_event_log(event)
+        await append_ui_event_log(event)
     # Always include the current session's saved proxy config in status
-    status["proxy"] = resolve_proxy_from_session_cfg(cfg) or {}
+    status["proxy"] = await resolve_proxy_from_session_cfg(cfg) or {}
 
     # Always provide detected IP for user convenience, regardless of monitoring mode
     status["detected_public_ip"] = detected_public_ip
@@ -1350,18 +1282,13 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
 
     status["proxied_public_ip"] = proxied_public_ip
     status["proxied_public_ip_asn"] = proxied_public_ip_asn
-    status["proxied_public_ip_as"] = None
-    if proxied_public_ip:
-        # Get full AS string for proxied IP
-        asn_full_proxied, _ = await get_asn_and_timezone_from_ip(proxied_public_ip)
-        status["proxied_public_ip_as"] = asn_full_proxied
+    # Reuse the AS from the single proxied lookup above instead of re-fetching.
+    status["proxied_public_ip_as"] = proxied_public_ip_as
     # Always set the top-level status message for the UI, prioritizing error/rate limit, then success, then fallback
     if auto_update_result is not None:
         status["auto_update_seedbox"] = auto_update_result
         # Priority: error (rate limit or other)
-        error_val = (
-            auto_update_result.get("error") if isinstance(auto_update_result, dict) else None
-        )
+        error_val = auto_update_result.get("error")
         if error_val and isinstance(error_val, str):
             status["status_message"] = error_val
         # Next: explicit success message or reason
@@ -1406,107 +1333,160 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
             next_check_time_val = next_check_dt.isoformat()
         else:
             next_check_time_val = cached_next_check_time
-    return {
-        "mam_cookie_exists": status.get("mam_cookie_exists"),
-        "points": status.get("points"),
-        "wedge_active": status.get("wedge_active"),
-        "vip_active": status.get("vip_active"),
-        "current_ip": ip_to_use,
-        "current_ip_asn": asn,
-        "mam_session_as": mam_session_as,
-        "configured_ip": ip_to_use,
-        "configured_asn": asn,
-        "mam_seen_asn": mam_seen_asn,
-        "mam_seen_as": mam_seen_as,
-        "detected_public_ip": detected_public_ip,
-        "detected_public_ip_asn": detected_public_ip_asn,
-        "detected_public_ip_as": detected_public_ip_as,
-        "proxied_public_ip": proxied_public_ip,
-        "proxied_public_ip_asn": proxied_public_ip_asn,
-        "proxied_public_ip_as": proxied_public_ip_as,
-        "ip_monitoring_mode": ip_monitoring_mode,
-        "ip_source": "configured",
-        "message": status.get("message", "Please provide your MaM ID in the configuration."),
-        "last_check_time": last_check_time,
-        "next_check_time": next_check_time_val,
-        "timezone": timezone_used,
-        "check_freq": check_freq_minutes,
-        "status_message": status.get("status_message"),
-        "details": status,
-    }
+    return _status_payload(
+        next_check_time=next_check_time_val,
+        status_message=status.get("status_message"),
+        ip_source="configured",
+        message=status.get("message", "Please provide your MaM ID in the configuration."),
+        timezone=TZ,
+    )
 
 
 @app.post("/api/session/refresh")
-def api_session_refresh(request: Request) -> dict[str, Any]:
+async def api_session_refresh() -> dict[str, Any]:
     """Trigger a lightweight session refresh.
 
     This validates that a global MaM ID is configured and returns a simple
     success message. Used by the frontend to verify that session data are
     available.
     """
-    cfg = load_config()
+    cfg = await load_config()
     mam_id = cfg.get("mam", {}).get("mam_id", "")
     if not mam_id:
         raise HTTPException(status_code=400, detail="MaM ID not configured.")
-    try:
-        return {"success": True, "message": "Session refreshed."}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    return {"success": True, "message": "Session refreshed."}
 
 
 @app.get("/api/sessions")
-def api_list_sessions() -> dict[str, Any]:
+async def api_list_sessions() -> dict[str, Any]:
     """Return a list of saved session labels.
 
     Response format: {"sessions": [...labels...]}
     """
-    sessions = list_sessions()
+    sessions = await list_sessions()
     _logger.debug("[Session] Listed sessions: count=%s", len(sessions))
     return {"sessions": sessions}
 
 
 @app.get("/api/session/{label}")
-def api_load_session(label: str) -> dict[str, Any]:
+async def api_load_session(label: str) -> dict[str, Any]:
     """Load and return a session configuration by label.
 
     Raises HTTPException(404) if the session does not exist.
     """
-    cfg = load_session(label)
-    if cfg is None:
-        _logger.warning("Session '%s' not found or not configured.", label)
-        raise HTTPException(status_code=404, detail=f"Session '{label}' not found.")
-    return cfg
+    return await load_session(label)
+
+
+@dataclass(frozen=True)
+class _IndexerService:
+    """One MAM-ID-syncable indexer integration."""
+
+    name: str
+    cfg_key: str
+    sync: Callable[[dict[str, Any], str], Awaitable[dict[str, Any]]]
+
+
+async def _sync_jackett(cfg: dict[str, Any], mam_id: str) -> dict[str, Any]:
+    """Adapt Jackett's host/port/key config to the common (cfg, mam_id) sync interface."""
+    jc = cfg.get("jackett", {})
+    host = jc.get("host", "").strip()
+    port = jc.get("port", 9117)
+    api_key = jc.get("api_key", "").strip()
+    admin_password = jc.get("admin_password", "").strip()
+    if not all([host, port, api_key, admin_password]):
+        return {"success": False, "error": "incomplete configuration"}
+    return await sync_mam_id_to_jackett(host, port, api_key, admin_password, mam_id)
+
+
+async def _sync_audiobookrequest(cfg: dict[str, Any], mam_id: str) -> dict[str, Any]:
+    """Adapt AudioBookRequest's host/port/key config to the common sync interface."""
+    ac = cfg.get("audiobookrequest", {})
+    host = ac.get("host", "").strip()
+    port = ac.get("port", 3000)
+    api_key = ac.get("api_key", "").strip()
+    if not all([host, port, api_key]):
+        return {"success": False, "error": "incomplete configuration"}
+    return await sync_mam_id_to_audiobookrequest(host, port, api_key, mam_id)
+
+
+async def _sync_autobrr(cfg: dict[str, Any], mam_id: str) -> dict[str, Any]:
+    """Adapt Autobrr's host/port/key config to the common sync interface."""
+    ac = cfg.get("autobrr", {})
+    host = ac.get("host", "").strip()
+    port = ac.get("port", 7474)
+    api_key = ac.get("api_key", "").strip()
+    if not all([host, port, api_key]):
+        return {"success": False, "error": "incomplete configuration"}
+    return await sync_mam_id_to_autobrr(host, port, api_key, mam_id)
+
+
+_INDEXER_SERVICES: list[_IndexerService] = [
+    _IndexerService("Prowlarr", "prowlarr", sync_mam_id_to_prowlarr),
+    _IndexerService("Chaptarr", "chaptarr", sync_mam_id_to_chaptarr),
+    _IndexerService("Jackett", "jackett", _sync_jackett),
+    _IndexerService("AudioBookRequest", "audiobookrequest", _sync_audiobookrequest),
+    _IndexerService("Autobrr", "autobrr", _sync_autobrr),
+]
+
+
+async def _sync_indexers(
+    cfg: dict[str, Any],
+    mam_id: str,
+    label: str,
+    *,
+    require_auto_update_on_save: bool,
+    verbose: bool,
+    prev_mam_id: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Sync `mam_id` to every enabled indexer service, returning (updated, failed) names.
+
+    `require_auto_update_on_save` additionally gates each service on its
+    `auto_update_on_save` flag; `verbose` emits per-service info/warning logs.
+    """
+    updated: list[str] = []
+    failed: list[str] = []
+    for svc in _INDEXER_SERVICES:
+        svc_cfg = cfg.get(svc.cfg_key, {})
+        enabled = svc_cfg.get("enabled")
+        if require_auto_update_on_save:
+            enabled = enabled and svc_cfg.get("auto_update_on_save")
+        if not enabled:
+            continue
+        if verbose:
+            _logger.info(
+                "[%s] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
+                svc.name,
+                label,
+                prev_mam_id,
+                mam_id,
+            )
+        try:
+            result = await svc.sync(cfg, mam_id)
+            if result.get("success"):
+                if verbose:
+                    _logger.info("[%s] Auto-update successful: %s", svc.name, result.get("message"))
+                updated.append(svc.name)
+            else:
+                detail = result.get("error") or result.get("message") or "Unknown error"
+                if verbose:
+                    _logger.warning("[%s] Auto-update failed: %s", svc.name, detail)
+                failed.append(f"{svc.name} ({detail})")
+        except Exception as e:
+            _logger.error("[%s] MAM ID sync error for session '%s': %s", svc.name, label, e)
+            failed.append(f"{svc.name} ({e!s})")
+    return updated, failed
 
 
 async def _sync_integrations_if_mam_id_changed(
     cfg: dict[str, Any], label: str, new_mam_id: str | None, prev_mam_id: str | None
 ) -> None:
     """Push updated mam_id to all enabled integrations when it has changed."""
-    prowlarr_cfg = cfg.get("prowlarr", {})
-    chaptarr_cfg = cfg.get("chaptarr", {})
-    jackett_cfg = cfg.get("jackett", {})
-    audiobookrequest_cfg = cfg.get("audiobookrequest", {})
-    autobrr_cfg = cfg.get("autobrr", {})
-
-    prowlarr_enabled = prowlarr_cfg.get("enabled") and prowlarr_cfg.get("auto_update_on_save")
-    chaptarr_enabled = chaptarr_cfg.get("enabled") and chaptarr_cfg.get("auto_update_on_save")
-    jackett_enabled = jackett_cfg.get("enabled") and jackett_cfg.get("auto_update_on_save")
-    audiobookrequest_enabled = audiobookrequest_cfg.get("enabled") and audiobookrequest_cfg.get(
-        "auto_update_on_save"
+    any_enabled = any(
+        cfg.get(svc.cfg_key, {}).get("enabled")
+        and cfg.get(svc.cfg_key, {}).get("auto_update_on_save")
+        for svc in _INDEXER_SERVICES
     )
-    autobrr_enabled = autobrr_cfg.get("enabled") and autobrr_cfg.get("auto_update_on_save")
-
-    if not (
-        (
-            prowlarr_enabled
-            or chaptarr_enabled
-            or jackett_enabled
-            or audiobookrequest_enabled
-            or autobrr_enabled
-        )
-        and new_mam_id
-        and new_mam_id != prev_mam_id
-    ):
+    if not (any_enabled and new_mam_id and new_mam_id != prev_mam_id):
         if new_mam_id == prev_mam_id:
             _logger.debug(
                 "[Indexers] Auto-update skipped for session '%s' (MAM ID unchanged: %s)",
@@ -1520,128 +1500,21 @@ async def _sync_integrations_if_mam_id_changed(
             )
         return
 
-    updated_services = []
-    failed_services = []
-
-    # Update Prowlarr if enabled
-    if prowlarr_enabled:
-        try:
-            _logger.info(
-                "[Prowlarr] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
-                label,
-                prev_mam_id,
-                new_mam_id,
-            )
-            result = await sync_mam_id_to_prowlarr(cfg, new_mam_id)
-            if result.get("success"):
-                _logger.info("[Prowlarr] Auto-update successful: %s", result.get("message"))
-                updated_services.append("Prowlarr")
-            else:
-                _logger.warning("[Prowlarr] Auto-update failed: %s", result.get("message"))
-                failed_services.append(f"Prowlarr ({result.get('message')})")
-        except Exception as e:
-            _logger.error("[Prowlarr] Auto-update error for session '%s': %s", label, e)
-            failed_services.append(f"Prowlarr ({e!s})")
-
-    # Update Chaptarr if enabled
-    if chaptarr_enabled:
-        try:
-            _logger.info(
-                "[Chaptarr] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
-                label,
-                prev_mam_id,
-                new_mam_id,
-            )
-            result = await sync_mam_id_to_chaptarr(cfg, new_mam_id)
-            if result.get("success"):
-                _logger.info("[Chaptarr] Auto-update successful: %s", result.get("message"))
-                updated_services.append("Chaptarr")
-            else:
-                _logger.warning("[Chaptarr] Auto-update failed: %s", result.get("message"))
-                failed_services.append(f"Chaptarr ({result.get('message')})")
-        except Exception as e:
-            _logger.error("[Chaptarr] Auto-update error for session '%s': %s", label, e)
-            failed_services.append(f"Chaptarr ({e!s})")
-
-    # Update Jackett if enabled
-    if jackett_enabled:
-        try:
-            _logger.info(
-                "[Jackett] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
-                label,
-                prev_mam_id,
-                new_mam_id,
-            )
-            host = jackett_cfg.get("host", "").strip()
-            port = jackett_cfg.get("port", 9117)
-            api_key = jackett_cfg.get("api_key", "").strip()
-            admin_password = jackett_cfg.get("admin_password", "").strip()
-            result = await sync_mam_id_to_jackett(host, port, api_key, admin_password, new_mam_id)
-            if result.get("success"):
-                _logger.info("[Jackett] Auto-update successful: %s", result.get("message"))
-                updated_services.append("Jackett")
-            else:
-                error_msg = result.get("error", "Unknown error")
-                _logger.warning("[Jackett] Auto-update failed: %s", error_msg)
-                failed_services.append(f"Jackett ({error_msg})")
-        except Exception as e:
-            _logger.error("[Jackett] Auto-update error for session '%s': %s", label, e)
-            failed_services.append(f"Jackett ({e!s})")
-
-    # Update AudioBookRequest if enabled
-    if audiobookrequest_enabled:
-        try:
-            _logger.info(
-                "[AudioBookRequest] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
-                label,
-                prev_mam_id,
-                new_mam_id,
-            )
-            host = audiobookrequest_cfg.get("host", "").strip()
-            port = audiobookrequest_cfg.get("port", 3000)
-            api_key = audiobookrequest_cfg.get("api_key", "").strip()
-            result = await sync_mam_id_to_audiobookrequest(host, port, api_key, new_mam_id)
-            if result.get("success"):
-                _logger.info("[AudioBookRequest] Auto-update successful: %s", result.get("message"))
-                updated_services.append("AudioBookRequest")
-            else:
-                error_msg = result.get("error", "Unknown error")
-                _logger.warning("[AudioBookRequest] Auto-update failed: %s", error_msg)
-                failed_services.append(f"AudioBookRequest ({error_msg})")
-        except Exception as e:
-            _logger.error("[AudioBookRequest] Auto-update error for session '%s': %s", label, e)
-            failed_services.append(f"AudioBookRequest ({e!s})")
-
-    # Update Autobrr if enabled
-    if autobrr_enabled:
-        try:
-            _logger.info(
-                "[Autobrr] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
-                label,
-                prev_mam_id,
-                new_mam_id,
-            )
-            host = autobrr_cfg.get("host", "").strip()
-            port = autobrr_cfg.get("port", 7474)
-            api_key = autobrr_cfg.get("api_key", "").strip()
-            result = await sync_mam_id_to_autobrr(host, port, api_key, new_mam_id)
-            if result.get("success"):
-                _logger.info("[Autobrr] Auto-update successful: %s", result.get("message"))
-                updated_services.append("Autobrr")
-            else:
-                error_msg = result.get("error", "Unknown error")
-                _logger.warning("[Autobrr] Auto-update failed: %s", error_msg)
-                failed_services.append(f"Autobrr ({error_msg})")
-        except Exception as e:
-            _logger.error("[Autobrr] Auto-update error for session '%s': %s", label, e)
-            failed_services.append(f"Autobrr ({e!s})")
+    updated_services, failed_services = await _sync_indexers(
+        cfg,
+        new_mam_id,
+        label,
+        require_auto_update_on_save=True,
+        verbose=True,
+        prev_mam_id=prev_mam_id,
+    )
 
     # Log event with detailed message
     if updated_services:
         status_msg = f"MAM ID synced to {', '.join(updated_services)}"
         if failed_services:
             status_msg += f". Failed: {', '.join(failed_services)}"
-        append_ui_event_log(
+        await append_ui_event_log(
             {
                 "event": "indexer_auto_updated",
                 "label": label,
@@ -1651,7 +1524,7 @@ async def _sync_integrations_if_mam_id_changed(
             }
         )
     elif failed_services:
-        append_ui_event_log(
+        await append_ui_event_log(
             {
                 "event": "indexer_auto_update_failed",
                 "label": label,
@@ -1662,6 +1535,17 @@ async def _sync_integrations_if_mam_id_changed(
         )
 
 
+async def _load_prev_session(old_label: str | None, label: str | None) -> dict[str, Any] | None:
+    """Load the previous session config by ``old_label`` (preferred) or ``label``; None on any failure."""
+    target = old_label or label
+    if not target:
+        return None
+    try:
+        return await load_session(target)
+    except Exception:
+        return None
+
+
 @app.post("/api/session/save")
 async def api_save_session(request: Request) -> dict[str, Any]:
     """Save or update a session configuration.
@@ -1670,8 +1554,6 @@ async def api_save_session(request: Request) -> dict[str, Any]:
     preserves sensitive proxy passwords if omitted, persists the session
     YAML, and re-registers scheduler jobs as needed.
     """
-    global session_status_cache
-
     try:
         cfg = await request.json()
         old_label = cfg.get("old_label")
@@ -1679,16 +1561,7 @@ async def api_save_session(request: Request) -> dict[str, Any]:
         prev_cfg = None
 
         if "proxy" in cfg:
-            if old_label:
-                try:
-                    prev_cfg = load_session(old_label)
-                except Exception:
-                    prev_cfg = None
-            elif cfg.get("label"):
-                try:
-                    prev_cfg = load_session(cfg["label"])
-                except Exception:
-                    prev_cfg = None
+            prev_cfg = await _load_prev_session(old_label, cfg.get("label"))
             # If password is missing but previous session had one, keep it
             if (
                 isinstance(proxy_cfg, dict)
@@ -1715,33 +1588,21 @@ async def api_save_session(request: Request) -> dict[str, Any]:
         ]
         # If prev_cfg not set above, try to load it now
         if prev_cfg is None:
-            if old_label:
-                try:
-                    prev_cfg = load_session(old_label)
-                except Exception:
-                    prev_cfg = None
-            elif cfg.get("label"):
-                try:
-                    prev_cfg = load_session(cfg["label"])
-                except Exception:
-                    prev_cfg = None
+            prev_cfg = await _load_prev_session(old_label, cfg.get("label"))
         if prev_cfg:
             for field in backend_fields:
                 if field in prev_cfg and field not in cfg:
                     cfg[field] = prev_cfg[field]
 
         label = cfg.get("label")
-        session_path = get_session_path(label)
-        is_new = not Path(session_path).exists()
-
-        if is_new:
+        if not get_session_path(label).exists():
             # Clear any old event log entries for this session label
 
-            clear_ui_event_log_for_session(label)
+            await clear_ui_event_log_for_session(label)
             # Only log creation event
-            save_session(cfg, old_label=old_label)
+            await save_session(cfg, old_label=old_label)
             _logger.info("[Session] Created session: label=%s", label)
-            append_ui_event_log(
+            await append_ui_event_log(
                 {
                     "event": "session_created",
                     "label": label,
@@ -1756,9 +1617,9 @@ async def api_save_session(request: Request) -> dict[str, Any]:
                 session_status_cache[label]["suppress_next_event"] = True
         else:
             # Only log save event (update)
-            save_session(cfg, old_label=old_label)
+            await save_session(cfg, old_label=old_label)
             _logger.info("[Session] Saved session: label=%s old_label=%s", label, old_label)
-            append_ui_event_log(
+            await append_ui_event_log(
                 {
                     "event": "session_saved",
                     "label": label,
@@ -1779,7 +1640,7 @@ async def api_save_session(request: Request) -> dict[str, Any]:
                     _logger.info("[APScheduler] Removed job for renamed session '%s'", old_label)
 
             # Register/update the job for the current session
-            register_session_job(label)
+            await register_session_job(label)
         except Exception as e:
             _logger.error(
                 "[APScheduler] Failed to manage session job for '%s' after save: %s", label, e
@@ -1797,19 +1658,19 @@ async def api_save_session(request: Request) -> dict[str, Any]:
 
 
 @app.delete("/api/session/delete/{label}")
-def api_delete_session(label: str) -> dict[str, Any]:
+async def api_delete_session(label: str) -> dict[str, Any]:
     """Delete a session by label and clear related UI event log entries.
 
     Returns a success flag or raises HTTPException on failure.
     """
     try:
-        delete_session(label)
-        clear_ui_event_log_for_session(label)
+        await delete_session(label)
+        await clear_ui_event_log_for_session(label)
         # If no sessions remain, blank out last_session.yaml
-        if len(list_sessions()) == 0:
-            write_last_session(None)
+        if len(await list_sessions()) == 0:
+            await write_last_session(None)
         _logger.info("[Session] Deleted session: label=%s", label)
-        append_ui_event_log(
+        await append_ui_event_log(
             {
                 "event": "session_deleted",
                 "label": label,
@@ -1837,10 +1698,7 @@ async def api_save_perkautomation(request: Request) -> dict[str, Any]:
         label = data.get("label")
         if not label:
             raise HTTPException(status_code=400, detail="Session label required.")
-        cfg = load_session(label)
-        if cfg is None:
-            _logger.warning("Session '%s' not found or not configured.", label)
-            return {"success": False, "error": f"Session '{label}' not found."}
+        cfg = await load_session(label)
         # Save automation settings to session config
         new_pa = data.get("perk_automation", {})
         old_pa = cfg.get("perk_automation", {})
@@ -1858,13 +1716,11 @@ async def api_save_perkautomation(request: Request) -> dict[str, Any]:
             enabled = auto.get("enabled", False)
             trigger_type = auto.get("trigger_type", "time")
             # Map automation_key to new timestamp field
-            ts_field = None
-            if automation_key == "upload_credit":
-                ts_field = "last_upload_time"
-            elif automation_key == "vip_automation":
-                ts_field = "last_vip_time"
-            elif automation_key == "wedge_automation":
-                ts_field = "last_wedge_time"
+            ts_field = {
+                "upload_credit": "last_upload_time",
+                "vip_automation": "last_vip_time",
+                "wedge_automation": "last_wedge_time",
+            }.get(automation_key)
             if not ts_field:
                 return
             # If disabling, always clear timestamp
@@ -1875,24 +1731,27 @@ async def api_save_perkautomation(request: Request) -> dict[str, Any]:
                     cfg["perk_automation"][automation_key].pop(ts_field, None)
                 return
             # If enabling and time-based, set timestamp if missing
-            if enabled and trigger_type in ("time", "both"):
-                if not old_pa.get(automation_key, {}).get(ts_field):
-                    auto[ts_field] = now_iso
-                    _logger.info(
-                        "[PerkAutomation] Timer initialized for '%s' automation in session '%s' at %s (settings save, not a purchase).",
-                        automation_key,
-                        label,
-                        now_iso,
-                    )
+            if (
+                enabled
+                and trigger_type in ("time", "both")
+                and not old_pa.get(automation_key, {}).get(ts_field)
+            ):
+                auto[ts_field] = now_iso
+                _logger.info(
+                    "[PerkAutomation] Timer initialized for '%s' automation in session '%s' at %s (settings save, not a purchase).",
+                    automation_key,
+                    label,
+                    now_iso,
+                )
 
         handle_time_trigger("upload_credit")
         handle_time_trigger("vip_automation")
         handle_time_trigger("wedge_automation")
 
         cfg["perk_automation"] = new_pa
-        save_session(cfg, old_label=label)
+        await save_session(cfg, old_label=label)
         _logger.info("[PerkAutomation] Saved automation settings for session '%s'.", label)
-        append_ui_event_log(
+        await append_ui_event_log(
             {
                 "event_type": "config",
                 "label": label,
@@ -1921,10 +1780,7 @@ async def api_update_seedbox(request: Request) -> dict[str, Any]:
         label = data.get("label")
         if not label:
             raise HTTPException(status_code=400, detail="Session label required.")
-        cfg = load_session(label)
-        if cfg is None:
-            _logger.warning("Session '%s' not found or not configured.", label)
-            raise HTTPException(status_code=404, detail=f"Session '{label}' not found.")
+        cfg = await load_session(label)
         mam_id = cfg.get("mam", {}).get("mam_id", "")
         if not mam_id:
             raise HTTPException(status_code=400, detail="MaM ID not configured in session.")
@@ -1933,8 +1789,7 @@ async def api_update_seedbox(request: Request) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail="Session mam_ip (entered IP) is required.")
         ip_to_use = mam_ip_override
         asn_full, _ = await get_asn_and_timezone_from_ip(ip_to_use)
-        match = re.search(r"(AS)?(\d+)", asn_full or "") if asn_full else None
-        asn = match.group(2) if match else asn_full
+        asn = extract_asn_number(asn_full) or asn_full
         last_seedbox_ip = cfg.get("last_seedbox_ip")
         last_seedbox_asn = cfg.get("last_seedbox_asn")
         last_seedbox_update = cfg.get("last_seedbox_update")
@@ -1952,30 +1807,22 @@ async def api_update_seedbox(request: Request) -> dict[str, Any]:
             return {"success": True, "msg": "No change: IP/ASN already set."}
         # Proxy config: always resolve from proxies.yaml using session config
 
-        proxy_cfg = resolve_proxy_from_session_cfg(cfg)
+        proxy_cfg = await resolve_proxy_from_session_cfg(cfg)
         cookies = {"mam_id": mam_id}
         proxies = None
         if proxy_cfg:
             proxies = build_proxy_dict(proxy_cfg)
         # Log proxy label and redacted URL for debugging
-        if proxies:
-            proxy_label = proxy_cfg.get("label") if proxy_cfg else None
-            proxy_url_log = {
-                k: v.replace(proxy_cfg.get("password", ""), "***")
-                if proxy_cfg and proxy_cfg.get("password")
-                else v
-                for k, v in proxies.items()
-            }
+        if proxy_cfg and proxies:
             _logger.debug(
-                "[SeedboxUpdate] Using proxy label: %s, proxies: %s", proxy_label, proxy_url_log
+                "[SeedboxUpdate] Using proxy label: %s, proxies: %s",
+                proxy_cfg.get("label"),
+                redact_proxy_urls(proxies, proxy_cfg),
             )
 
-        resp_status = None
-        resp_text = None
-        result = None
         timeout = aiohttp.ClientTimeout(total=10)
         proxy_url = None
-        if proxies and isinstance(proxies, dict):
+        if proxies:
             proxy_url = proxies.get("https") or proxies.get("http")
         try:
             async with (
@@ -2001,9 +1848,9 @@ async def api_update_seedbox(request: Request) -> dict[str, Any]:
             cfg["last_seedbox_ip"] = ip_to_use
             cfg["last_seedbox_asn"] = asn
             cfg["last_seedbox_update"] = now.isoformat()
-            save_session(cfg, old_label=label)
+            await save_session(cfg, old_label=label)
             # Use a user-friendly message if the API message is missing or generic
-            api_msg = result.get("msg", "").strip()
+            api_msg = str(result.get("msg", "")).strip()
             if not api_msg or api_msg.lower() == "completed":
                 api_msg = "IP Changed. Seedbox IP updated."
             return {"success": True, "msg": api_msg, "ip": ip_to_use, "asn": asn}
@@ -2011,16 +1858,14 @@ async def api_update_seedbox(request: Request) -> dict[str, Any]:
             cfg["last_seedbox_ip"] = ip_to_use
             cfg["last_seedbox_asn"] = asn
             cfg["last_seedbox_update"] = now.isoformat()
-            save_session(cfg, old_label=label)
+            await save_session(cfg, old_label=label)
             return {
                 "success": True,
                 "msg": "No change: IP/ASN already set.",
                 "ip": ip_to_use,
                 "asn": asn,
             }
-        if resp_status == 429 or (
-            isinstance(result.get("msg"), str) and "too recent" in result.get("msg", "")
-        ):
+        if resp_status == 429 or ("too recent" in str(result.get("msg", ""))):
             return {
                 "success": False,
                 "error": "Rate limit: last change too recent. Try again later.",
@@ -2050,7 +1895,7 @@ async def api_test_expiry_notification(request: Request) -> dict[str, Any]:
             return {"success": False, "message": "Session label required"}
 
         # Load session
-        cfg = load_session(label)
+        cfg = await load_session(label)
         if not cfg:
             return {"success": False, "message": f"Session '{label}' not found"}
 
@@ -2062,18 +1907,15 @@ async def api_test_expiry_notification(request: Request) -> dict[str, Any]:
         created_date_str = cfg.get("mam_session_created_date")
         if created_date_str:
             try:
-                if "T" in created_date_str and len(created_date_str) == 16:
-                    created_date = datetime.fromisoformat(created_date_str)
-                else:
-                    created_date = datetime.fromisoformat(created_date_str)
+                created_date = datetime.fromisoformat(created_date_str)
             except Exception:
-                created_date = datetime.now() - timedelta(days=25)
+                created_date = datetime.now(UTC) - timedelta(days=25)
         else:
             # Simulate a session expiring in 5 days
-            created_date = datetime.now() - timedelta(days=25)
+            created_date = datetime.now(UTC) - timedelta(days=25)
 
         expiry_date = created_date + timedelta(days=30)
-        days_until_expiry = (expiry_date - datetime.now()).days
+        days_until_expiry = (expiry_date - datetime.now(UTC)).days
 
         # Get MAM ID and redact for security
         mam_id = cfg.get("mam", {}).get("mam_id", "N/A")
@@ -2146,7 +1988,7 @@ async def api_test_asn_notifications(request: Request) -> dict[str, Any]:
             return {"success": False, "message": "Session label required"}
 
         # Load session
-        cfg = load_session(label)
+        cfg = await load_session(label)
         if not cfg:
             return {"success": False, "message": f"Session '{label}' not found"}
 
@@ -2291,9 +2133,7 @@ async def api_prowlarr_update(request: Request) -> dict[str, Any]:
         if not label:
             return {"success": False, "message": "Session label required"}
 
-        cfg = load_session(label)
-        if cfg is None:
-            return {"success": False, "message": f"Session '{label}' not found"}
+        cfg = await load_session(label)
 
         # Use provided mam_id or fall back to session config
         mam_id = data.get("mam_id") or cfg.get("mam", {}).get("mam_id", "")
@@ -2306,7 +2146,7 @@ async def api_prowlarr_update(request: Request) -> dict[str, Any]:
         result = await sync_mam_id_to_prowlarr(cfg, mam_id)
         if result["success"]:
             # Log success event
-            append_ui_event_log(
+            await append_ui_event_log(
                 {
                     "event": "prowlarr_manual_update",
                     "label": label,
@@ -2316,7 +2156,7 @@ async def api_prowlarr_update(request: Request) -> dict[str, Any]:
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
             )
-        return result  # noqa: TRY300
+        return result
     except Exception as e:
         _logger.exception("Failed to update Prowlarr")
         return {"success": False, "message": f"Error: {e!s}"}
@@ -2387,9 +2227,7 @@ async def api_chaptarr_update(request: Request) -> dict[str, Any]:
         if not label:
             return {"success": False, "message": "Session label required"}
 
-        cfg = load_session(label)
-        if cfg is None:
-            return {"success": False, "message": f"Session '{label}' not found"}
+        cfg = await load_session(label)
 
         # Use provided mam_id or fall back to session config
         mam_id = data.get("mam_id") or cfg.get("mam", {}).get("mam_id", "")
@@ -2402,7 +2240,7 @@ async def api_chaptarr_update(request: Request) -> dict[str, Any]:
         result = await sync_mam_id_to_chaptarr(cfg, mam_id)
         if result["success"]:
             # Log success event
-            append_ui_event_log(
+            await append_ui_event_log(
                 {
                     "event": "chaptarr_manual_update",
                     "label": label,
@@ -2412,7 +2250,7 @@ async def api_chaptarr_update(request: Request) -> dict[str, Any]:
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
             )
-        return result  # noqa: TRY300
+        return result
     except Exception as e:
         _logger.exception("Failed to update Chaptarr")
         return {"success": False, "message": f"Error: {e!s}"}
@@ -2461,9 +2299,7 @@ async def api_jackett_update(request: Request) -> dict[str, Any]:
         if not label:
             return {"success": False, "message": "Session label required"}
 
-        cfg = load_session(label)
-        if cfg is None:
-            return {"success": False, "message": f"Session '{label}' not found"}
+        cfg = await load_session(label)
 
         # Use provided mam_id or fall back to session config
         mam_id = data.get("mam_id") or cfg.get("mam", {}).get("mam_id", "")
@@ -2492,7 +2328,7 @@ async def api_jackett_update(request: Request) -> dict[str, Any]:
         result = await sync_mam_id_to_jackett(host, port, api_key, admin_password, mam_id)
         if result.get("success"):
             # Log success event
-            append_ui_event_log(
+            await append_ui_event_log(
                 {
                     "event": "jackett_manual_update",
                     "label": label,
@@ -2502,7 +2338,7 @@ async def api_jackett_update(request: Request) -> dict[str, Any]:
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
             )
-        return result  # noqa: TRY300
+        return result
     except Exception as e:
         _logger.exception("Failed to update Jackett")
         return {"success": False, "message": f"Error: {e!s}"}
@@ -2549,9 +2385,7 @@ async def api_audiobookrequest_update(request: Request) -> dict[str, Any]:
         if not label:
             return {"success": False, "message": "Session label required"}
 
-        cfg = load_session(label)
-        if cfg is None:
-            return {"success": False, "message": f"Session '{label}' not found"}
+        cfg = await load_session(label)
 
         # Use provided mam_id or fall back to session config
         mam_id = data.get("mam_id") or cfg.get("mam", {}).get("mam_id", "")
@@ -2579,7 +2413,7 @@ async def api_audiobookrequest_update(request: Request) -> dict[str, Any]:
         result = await sync_mam_id_to_audiobookrequest(host, port, api_key, mam_id)
         if result.get("success"):
             # Log success event
-            append_ui_event_log(
+            await append_ui_event_log(
                 {
                     "event": "audiobookrequest_manual_update",
                     "label": label,
@@ -2589,7 +2423,7 @@ async def api_audiobookrequest_update(request: Request) -> dict[str, Any]:
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
             )
-        return result  # noqa: TRY300
+        return result
     except Exception as e:
         _logger.exception("Failed to update AudioBookRequest")
         return {"success": False, "message": f"Error: {e!s}"}
@@ -2636,9 +2470,7 @@ async def api_autobrr_update(request: Request) -> dict[str, Any]:
         if not label:
             return {"success": False, "message": "Session label required"}
 
-        cfg = load_session(label)
-        if cfg is None:
-            return {"success": False, "message": f"Session '{label}' not found"}
+        cfg = await load_session(label)
 
         # Use provided mam_id or fall back to session config
         mam_id = data.get("mam_id") or cfg.get("mam", {}).get("mam_id", "")
@@ -2666,7 +2498,7 @@ async def api_autobrr_update(request: Request) -> dict[str, Any]:
         result = await sync_mam_id_to_autobrr(host, port, api_key, mam_id)
         if result.get("success"):
             # Log success event
-            append_ui_event_log(
+            await append_ui_event_log(
                 {
                     "event": "autobrr_manual_update",
                     "label": label,
@@ -2676,7 +2508,7 @@ async def api_autobrr_update(request: Request) -> dict[str, Any]:
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
             )
-        return result  # noqa: TRY300
+        return result
     except Exception as e:
         _logger.exception("Failed to update Autobrr")
         return {"success": False, "message": f"Error: {e!s}"}
@@ -2698,9 +2530,7 @@ async def api_indexer_update(request: Request) -> dict[str, Any]:
         if not label:
             return {"success": False, "message": "Session label required"}
 
-        cfg = load_session(label)
-        if cfg is None:
-            return {"success": False, "message": f"Session '{label}' not found"}
+        cfg = await load_session(label)
 
         # Use provided mam_id or fall back to session config
         mam_id = data.get("mam_id") or cfg.get("mam", {}).get("mam_id", "")
@@ -2710,127 +2540,20 @@ async def api_indexer_update(request: Request) -> dict[str, Any]:
                 "message": "MAM ID not configured in session and not provided",
             }
 
-        prowlarr_cfg = cfg.get("prowlarr", {})
-        chaptarr_cfg = cfg.get("chaptarr", {})
-        jackett_cfg = cfg.get("jackett", {})
-        audiobookrequest_cfg = cfg.get("audiobookrequest", {})
-        autobrr_cfg = cfg.get("autobrr", {})
-
-        prowlarr_enabled = prowlarr_cfg.get("enabled", False)
-        chaptarr_enabled = chaptarr_cfg.get("enabled", False)
-        jackett_enabled = jackett_cfg.get("enabled", False)
-        audiobookrequest_enabled = audiobookrequest_cfg.get("enabled", False)
-        autobrr_enabled = autobrr_cfg.get("enabled", False)
-
-        if (
-            not prowlarr_enabled
-            and not chaptarr_enabled
-            and not jackett_enabled
-            and not audiobookrequest_enabled
-            and not autobrr_enabled
-        ):
+        if not any(cfg.get(svc.cfg_key, {}).get("enabled") for svc in _INDEXER_SERVICES):
             return {
                 "success": False,
                 "message": "No indexer integrations are enabled for this session",
             }
 
-        updated_services = []
-        failed_services = []
-
-        # Update Prowlarr if enabled
-        if prowlarr_enabled:
-            try:
-                result = await sync_mam_id_to_prowlarr(cfg, mam_id)
-                if result.get("success"):
-                    updated_services.append("Prowlarr")
-                else:
-                    failed_services.append(f"Prowlarr ({result.get('message')})")
-            except Exception as e:
-                _logger.error("[Prowlarr] Update error for session '%s': %s", label, e)
-                failed_services.append(f"Prowlarr ({e!s})")
-
-        # Update Chaptarr if enabled
-        if chaptarr_enabled:
-            try:
-                result = await sync_mam_id_to_chaptarr(cfg, mam_id)
-                if result.get("success"):
-                    updated_services.append("Chaptarr")
-                else:
-                    failed_services.append(f"Chaptarr ({result.get('message')})")
-            except Exception as e:
-                _logger.error("[Chaptarr] Update error for session '%s': %s", label, e)
-                failed_services.append(f"Chaptarr ({e!s})")
-
-        # Update Jackett if enabled
-        if jackett_enabled:
-            try:
-                host = jackett_cfg.get("host", "").strip()
-                port = jackett_cfg.get("port", 9117)
-                api_key = jackett_cfg.get("api_key", "").strip()
-                admin_password = jackett_cfg.get("admin_password", "").strip()
-
-                if not all([host, port, api_key, admin_password]):
-                    failed_services.append("Jackett (incomplete configuration)")
-                else:
-                    result = await sync_mam_id_to_jackett(
-                        host, port, api_key, admin_password, mam_id
-                    )
-                    if result.get("success"):
-                        updated_services.append("Jackett")
-                    else:
-                        failed_services.append(
-                            f"Jackett ({result.get('error', result.get('message'))})"
-                        )
-            except Exception as e:
-                _logger.error("[Jackett] Update error for session '%s': %s", label, e)
-                failed_services.append(f"Jackett ({e!s})")
-
-        # Update AudioBookRequest if enabled
-        if audiobookrequest_enabled:
-            try:
-                host = audiobookrequest_cfg.get("host", "").strip()
-                port = audiobookrequest_cfg.get("port", 3000)
-                api_key = audiobookrequest_cfg.get("api_key", "").strip()
-
-                if not all([host, port, api_key]):
-                    failed_services.append("AudioBookRequest (incomplete configuration)")
-                else:
-                    result = await sync_mam_id_to_audiobookrequest(host, port, api_key, mam_id)
-                    if result.get("success"):
-                        updated_services.append("AudioBookRequest")
-                    else:
-                        failed_services.append(
-                            f"AudioBookRequest ({result.get('error', result.get('message'))})"
-                        )
-            except Exception as e:
-                _logger.error("[AudioBookRequest] Update error for session '%s': %s", label, e)
-                failed_services.append(f"AudioBookRequest ({e!s})")
-
-        # Update Autobrr if enabled
-        if autobrr_enabled:
-            try:
-                host = autobrr_cfg.get("host", "").strip()
-                port = autobrr_cfg.get("port", 7474)
-                api_key = autobrr_cfg.get("api_key", "").strip()
-
-                if not all([host, port, api_key]):
-                    failed_services.append("Autobrr (incomplete configuration)")
-                else:
-                    result = await sync_mam_id_to_autobrr(host, port, api_key, mam_id)
-                    if result.get("success"):
-                        updated_services.append("Autobrr")
-                    else:
-                        failed_services.append(
-                            f"Autobrr ({result.get('error', result.get('message'))})"
-                        )
-            except Exception as e:
-                _logger.error("[Autobrr] Update error for session '%s': %s", label, e)
-                failed_services.append(f"Autobrr ({e!s})")
+        updated_services, failed_services = await _sync_indexers(
+            cfg, mam_id, label, require_auto_update_on_save=False, verbose=False
+        )
 
         # Prepare response
         if updated_services and not failed_services:
             status_msg = f"Successfully updated MAM ID in {', '.join(updated_services)}"
-            append_ui_event_log(
+            await append_ui_event_log(
                 {
                     "event": "indexer_manual_update",
                     "label": label,
@@ -2843,7 +2566,7 @@ async def api_indexer_update(request: Request) -> dict[str, Any]:
             return {"success": True, "message": status_msg}
         if updated_services and failed_services:
             status_msg = f"Partially successful: Updated {', '.join(updated_services)}. Failed: {', '.join(failed_services)}"
-            append_ui_event_log(
+            await append_ui_event_log(
                 {
                     "event": "indexer_partial_update",
                     "label": label,
@@ -2856,7 +2579,7 @@ async def api_indexer_update(request: Request) -> dict[str, Any]:
             return {"success": True, "message": status_msg, "warning": True}
         # All failed
         status_msg = f"Failed to update all services: {', '.join(failed_services)}"
-        return {"success": False, "message": status_msg}  # noqa: TRY300
+        return {"success": False, "message": status_msg}
 
     except Exception as e:
         _logger.exception("Failed to update indexer(s)")
@@ -2866,17 +2589,12 @@ async def api_indexer_update(request: Request) -> dict[str, Any]:
 @app.get("/api/server_time")
 def api_server_time() -> dict[str, Any]:
     """Return current server time in local timezone (ISO format)."""
-    from zoneinfo import ZoneInfo  # noqa: PLC0415
-
-    # Get timezone from environment variable or default to UTC
-    tz_name = os.environ.get("TZ", "UTC")
     try:
-        tz = ZoneInfo(tz_name)
+        tz = ZoneInfo(TZ)
     except Exception:
-        tz = ZoneInfo("UTC")
+        tz = UTC
 
-    now = datetime.now(tz)
-    return {"server_time": now.isoformat()}
+    return {"server_time": datetime.now(tz).isoformat()}
 
 
 @app.get("/api/version")
@@ -2886,8 +2604,7 @@ def api_version() -> dict[str, str]:
     The version is set via the APP_VERSION environment variable which is
     injected during the Docker build. Defaults to 'dev' for local builds.
     """
-    version = os.environ.get("APP_VERSION", "dev")
-    return {"version": version}
+    return {"version": APP_VERSION}
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -2896,14 +2613,9 @@ def favicon_ico() -> FileResponse:
 
     Returns a FileResponse when the file exists, otherwise raises 404.
     """
-    # Try Docker-friendly public dir first, then local repo frontend/public
-    candidates = [
-        Path(FRONTEND_PUBLIC_DIR) / "favicon.ico",
-        Path(BASE_DIR) / "../frontend/public/favicon.ico",
-    ]
-    for path in candidates:
-        if path.exists():
-            return FileResponse(str(path), media_type="image/x-icon")
+    path = FRONTEND_PUBLIC_DIR / "favicon.ico"
+    if path.exists():
+        return FileResponse(str(path), media_type="image/x-icon")
     raise HTTPException(status_code=404, detail="favicon.ico not found")
 
 
@@ -2913,13 +2625,9 @@ def favicon_svg() -> FileResponse:
 
     Returns a FileResponse when the file exists, otherwise raises 404.
     """
-    candidates = [
-        Path(FRONTEND_PUBLIC_DIR) / "favicon.svg",
-        Path(BASE_DIR) / "../frontend/public/favicon.svg",
-    ]
-    for path in candidates:
-        if path.exists():
-            return FileResponse(str(path), media_type="image/svg+xml")
+    path = FRONTEND_PUBLIC_DIR / "favicon.svg"
+    if path.exists():
+        return FileResponse(str(path), media_type="image/svg+xml")
     raise HTTPException(status_code=404, detail="favicon.svg not found")
 
 
@@ -2929,19 +2637,19 @@ def serve_react_index() -> FileResponse:
 
     This endpoint is used by the frontend catch-all route.
     """
-    index_path = Path(FRONTEND_BUILD_DIR) / "index.html"
+    index_path = FRONTEND_BUILD_DIR / "index.html"
     if index_path.exists():
         return FileResponse(str(index_path))
     raise HTTPException(status_code=404, detail="Frontend index.html not found")
 
 
 @app.get("/{full_path:path}", include_in_schema=False)
-def serve_react_app(full_path: str) -> FileResponse:
+def serve_react_app() -> FileResponse:
     """Serve the React app for all frontend paths (catch-all).
 
     If the build index.html exists, it is returned. Otherwise a 404 is raised.
     """
-    index_path = Path(FRONTEND_BUILD_DIR) / "index.html"
+    index_path = FRONTEND_BUILD_DIR / "index.html"
     if index_path.exists():
         return FileResponse(str(index_path))
     raise HTTPException(status_code=404, detail="Not Found")
@@ -2956,17 +2664,11 @@ async def session_check_job(label: str) -> None:
     """
     try:
         trigger_source = "scheduled"
-
-        frame = inspect.currentframe()
-        if frame is not None:
-            args, _, _, values = inspect.getargvalues(frame)
-            if "trigger_source" in values:
-                trigger_source = values["trigger_source"]
         _logger.info("[SessionCheck] label=%s source=%s", label, trigger_source)
-        cfg = load_session(label)
+        cfg = await load_session(label)
         mam_id = cfg.get("mam", {}).get("mam_id", "")
         mam_ip_override = cfg.get("mam_ip", "").strip()
-        proxy_cfg = resolve_proxy_from_session_cfg(cfg)
+        proxy_cfg = await resolve_proxy_from_session_cfg(cfg)
         # Single API call for IP detection (optimization)
         detected_ipinfo_data = await get_ipinfo_with_fallback()
         detected_public_ip = detected_ipinfo_data.get("ip")
@@ -2976,9 +2678,9 @@ async def session_check_job(label: str) -> None:
             if proxied_ip:
                 cfg["proxied_public_ip"] = proxied_ip
                 # Reload from disk before saving to avoid overwriting concurrent changes
-                fresh_cfg = load_session(label)
+                fresh_cfg = await load_session(label)
                 fresh_cfg["proxied_public_ip"] = proxied_ip
-                save_session(fresh_cfg, old_label=label)
+                await save_session(fresh_cfg, old_label=label)
         # Use mam_ip_override if set, else proxied_public_ip if set, else detected_public_ip
         ip_to_use: str | None = (
             mam_ip_override or cfg.get("proxied_public_ip") or detected_public_ip
@@ -2995,23 +2697,20 @@ async def session_check_job(label: str) -> None:
                 )
                 else None,
             )
-            match = re.search(r"(AS)?(\d+)", asn_full or "")
-            asn = match.group(2) if match else asn_full
+            asn = extract_asn_number(asn_full) or asn_full
         else:
             asn = None
         now = datetime.now(UTC)
         if mam_id:
-            proxy_cfg = resolve_proxy_from_session_cfg(cfg)
+            proxy_cfg = await resolve_proxy_from_session_cfg(cfg)
             # Capture old IP/ASN before update
             prev_ip = cfg.get("last_seedbox_ip")
             prev_asn = cfg.get("last_seedbox_asn")
             # Determine new IP/ASN (reuse detected data - optimization)
             proxied_ip = cfg.get("proxied_public_ip")
-            mam_ip_override = cfg.get("mam_ip", "").strip()
             new_ip = proxied_ip or detected_public_ip  # Reuse data from earlier
             asn_full, _ = await get_asn_and_timezone_from_ip(new_ip) if new_ip else (None, None)
-            match = re.search(r"(AS)?(\d+)", asn_full or "") if asn_full else None
-            new_asn = match.group(2) if match else asn_full
+            new_asn = extract_asn_number(asn_full) or asn_full
             status = await get_status(mam_id=mam_id, proxy_cfg=proxy_cfg)
             _refreshed_mam_id = status.pop("updated_mam_id", None)
             if _refreshed_mam_id and _refreshed_mam_id != mam_id:
@@ -3045,11 +2744,11 @@ async def session_check_job(label: str) -> None:
                     )
                     await keepalive_mam_session(cfg, label, now)
                     # Reload cfg so the fresh timestamps are visible to the save block below
-                    cfg = load_session(label)
+                    cfg = await load_session(label)
             # Check for increments in hit & run and unsatisfied counts before auto-update logic
-            await check_and_notify_count_increments(cfg, status, label)
+            await check_and_notify_count_increments(cfg, status)
             # Auto-update logic
-            auto_update_triggered, auto_update_result = await auto_update_seedbox_if_needed(
+            _, auto_update_result = await auto_update_seedbox_if_needed(
                 cfg, label, ip_to_use, asn, now
             )
             if auto_update_result is not None:
@@ -3076,12 +2775,12 @@ async def session_check_job(label: str) -> None:
             cfg["last_status"] = status
             # Reload from disk before saving to avoid overwriting concurrent changes
             # (e.g. perk_automation settings saved while awaiting network calls above)
-            fresh_cfg = load_session(label)
+            fresh_cfg = await load_session(label)
             if _refreshed_mam_id:
                 fresh_cfg["mam"]["mam_id"] = _refreshed_mam_id
             fresh_cfg["last_check_time"] = now.isoformat()
             fresh_cfg["last_status"] = status
-            save_session(fresh_cfg, old_label=label)
+            await save_session(fresh_cfg, old_label=label)
             # Log event using pre-update (old) and detected/proxied (new) values
             # Ensure auto_update is always a string, never None/null in JSON
             auto_update_val = get_auto_update_val(status)
@@ -3098,62 +2797,43 @@ async def session_check_job(label: str) -> None:
                         rate_limit_result.get("error")
                         or "Rate limited, waiting to update IP/ASN in config."
                     )
+            base_event = {
+                "timestamp": now.isoformat(),
+                "label": label,
+                "event_type": "scheduled",
+                "details": {
+                    "ip_compare": f"{prev_ip} -> {new_ip}",
+                    "asn_compare": f"{prev_asn} -> {new_asn}",
+                    "auto_update": auto_update_val,  # Always a string
+                },
+            }
             if is_rate_limited:
-                event = {
-                    "timestamp": now.isoformat(),
-                    "label": label,
-                    "event_type": "scheduled",
-                    "details": {
-                        "ip_compare": f"{prev_ip} -> {new_ip}",
-                        "asn_compare": f"{prev_asn} -> {new_asn}",
-                        "auto_update": auto_update_val,
-                    },
-                    "status_message": msg or "Rate limited, waiting to update IP/ASN in config.",
-                }
-                append_ui_event_log(event)
+                msg_text = msg or "Rate limited, waiting to update IP/ASN in config."
+                await append_ui_event_log({**base_event, "status_message": msg_text})
                 _logger.info("[SessionCheck][INFO] label=%s %s", label, msg)
             elif prev_ip is None or prev_asn is None or new_ip is None or new_asn is None:
                 warn_msg = "Unable to determine current or new IP/ASN—check connectivity or configuration. No update performed."
-                event = {
-                    "timestamp": now.isoformat(),
-                    "label": label,
-                    "event_type": "scheduled",
-                    "details": {
-                        "ip_compare": f"{prev_ip} -> {new_ip}",
-                        "asn_compare": f"{prev_asn} -> {new_asn}",
-                        "auto_update": auto_update_val,
-                    },
-                    "status_message": warn_msg,
-                }
-                append_ui_event_log(event)
+                await append_ui_event_log({**base_event, "status_message": warn_msg})
                 _logger.warning("[SessionCheck][WARNING] label=%s %s", label, warn_msg)
             else:
-                event = {
-                    "timestamp": now.isoformat(),
-                    "label": label,
-                    "event_type": "scheduled",
-                    "details": {
-                        "ip_compare": f"{prev_ip} -> {new_ip}",
-                        "asn_compare": f"{prev_asn} -> {new_asn}",
-                        "auto_update": auto_update_val,  # Always a string
-                    },
-                    "status_message": status.get("status_message", status.get("message", "OK")),
-                }
-                append_ui_event_log(event)
-                # ...removed debug _logger...
+                await append_ui_event_log(
+                    {
+                        **base_event,
+                        "status_message": status.get("status_message", status.get("message", "OK")),
+                    }
+                )
     except Exception as e:
         _logger.error("[APScheduler] Error in job for '%s': %s", label, e)
 
 
-def sync_session_check_job(label: str) -> None:
-    """Sync wrapper for async session_check_job to work with BackgroundScheduler."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+async def _scheduled_session_check(label: str) -> None:
+    """Run a session check on the event loop, bounded by a timeout to prevent hangs.
+
+    The timeout must stay below the minimum interval (60s) so a hung check never
+    blocks the next scheduled run.
+    """
     try:
-        # Add timeout to prevent jobs from hanging (especially on Windows Docker Desktop)
-        # Must be < minimum interval (60s) to avoid blocking subsequent jobs
-        task = loop.create_task(session_check_job(label))
-        loop.run_until_complete(asyncio.wait_for(task, timeout=45))  # 45s timeout
+        await asyncio.wait_for(session_check_job(label), timeout=45)
     except TimeoutError:
         _logger.error(
             "[APScheduler] Session check job for '%s' timed out after 45 seconds. "
@@ -3162,34 +2842,22 @@ def sync_session_check_job(label: str) -> None:
         )
     except Exception as e:
         _logger.error("[APScheduler] Session check job for '%s' failed: %s", label, e)
-    finally:
-        loop.close()
-
-
-def sync_automation_jobs() -> None:
-    """Sync wrapper for async run_all_automation_jobs to work with BackgroundScheduler."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(run_all_automation_jobs())
-    finally:
-        loop.close()
 
 
 # On startup, reset last_check_time to now for all sessions to keep timers in sync
-def reset_all_last_check_times() -> None:
+async def reset_all_last_check_times() -> None:
     """Reset the `last_check_time` for all sessions to the current time.
 
     This is called on startup to align scheduled timers and prevent immediate
     rate-limit collisions after restart.
     """
     now = datetime.now(UTC).isoformat()
-    session_labels = list_sessions()
+    session_labels = await list_sessions()
     for label in session_labels:
         try:
-            cfg = load_session(label)
+            cfg = await load_session(label)
             cfg["last_check_time"] = now
-            save_session(cfg, old_label=label)
+            await save_session(cfg, old_label=label)
         except Exception as e:
             _logger.warning(
                 "[Startup] Failed to reset last_check_time for session '%s': %s", label, e
@@ -3197,13 +2865,13 @@ def reset_all_last_check_times() -> None:
 
 
 # Register jobs for all sessions on startup
-def register_session_job(label: str) -> None:
+async def register_session_job(label: str) -> None:
     """Register APScheduler job for a single session.
 
     Args:
         label: The session label to register a job for
     """
-    cfg = load_session(label)
+    cfg = await load_session(label)
     check_freq = cfg.get("check_freq")
     mam_id = cfg.get("mam", {}).get("mam_id", "")
 
@@ -3221,7 +2889,7 @@ def register_session_job(label: str) -> None:
         scheduler.remove_job(job_id)
 
     scheduler.add_job(
-        sync_session_check_job,
+        _scheduled_session_check,
         trigger=IntervalTrigger(minutes=check_freq),
         args=[label],
         id=job_id,
@@ -3237,16 +2905,16 @@ def register_session_job(label: str) -> None:
     )
 
 
-def register_all_session_jobs() -> None:
+async def register_all_session_jobs() -> None:
     """Register APScheduler jobs for all sessions with valid settings.
 
     For each saved session this creates a job that runs `session_check_job`
     at the configured `check_freq` interval if the session has a MaM ID and
     a valid integer frequency.
     """
-    session_labels = list_sessions()
+    session_labels = await list_sessions()
     for label in session_labels:
-        register_session_job(label)
+        await register_session_job(label)
 
 
 # Immediate session check for all sessions at startup
@@ -3256,7 +2924,7 @@ async def run_initial_session_checks() -> None:
     Adds a small delay between checks to help avoid triggering external rate
     limits during application startup.
     """
-    session_labels = list_sessions()
+    session_labels = await list_sessions()
     for i, label in enumerate(session_labels):
         try:
             # Add a small delay between session checks to prevent rate limiting

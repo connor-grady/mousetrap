@@ -7,49 +7,54 @@ delegate to the utilities in :mod:`backend.notifications_backend` for the
 actual sending logic.
 """
 
-from pathlib import Path
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 import yaml
 
 from backend.notifications_backend import (
-    NOTIFY_CONFIG_PATH,
+    apprise_config_valid,
     load_notify_config,
     send_apprise_notification,
     send_pushover_notification,
     send_smtp_notification,
     send_webhook_notification,
 )
+from backend.paths import NOTIFY_PATH
 
 router = APIRouter()
 
 
-def save_notify_config(cfg: dict[str, Any]) -> None:
+async def save_notify_config(cfg: dict[str, Any]) -> None:
+    """Persist the notification configuration to disk (I/O offloaded to a worker thread)."""
+    await asyncio.to_thread(_save_notify_config, cfg)
+
+
+def _save_notify_config(cfg: dict[str, Any]) -> None:
     """Persist the notification configuration to disk.
 
     Args:
         cfg: Dictionary containing the notification configuration to save.
 
     """
-    path = Path(NOTIFY_CONFIG_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    NOTIFY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with NOTIFY_PATH.open("w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f)
 
 
 @router.get("/notify/config")
-def get_notify_config() -> dict[str, Any]:
+async def get_notify_config() -> dict[str, Any]:
     """Return the current notification configuration.
 
     The configuration is loaded from the configured notify config path and
     returned as a dictionary.
     """
-    return load_notify_config()
+    return await load_notify_config()
 
 
 @router.post("/notify/config")
-def set_notify_config(cfg: dict[str, Any]) -> dict[str, Any]:
+async def set_notify_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Save a new notification configuration.
 
     Args:
@@ -59,7 +64,7 @@ def set_notify_config(cfg: dict[str, Any]) -> dict[str, Any]:
         A dict with a "success" boolean indicating the write succeeded.
 
     """
-    save_notify_config(cfg)
+    await save_notify_config(cfg)
     return {"success": True}
 
 
@@ -78,7 +83,7 @@ async def test_webhook(payload: dict[str, Any]) -> dict[str, Any]:
         HTTPException: If no webhook URL is configured.
 
     """
-    cfg = load_notify_config()
+    cfg = await load_notify_config()
     url = cfg.get("webhook_url")
     discord_webhook = cfg.get("discord_webhook", False)
     if not url:
@@ -88,7 +93,7 @@ async def test_webhook(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.post("/notify/test/smtp")
-def test_smtp(payload: dict[str, Any]) -> dict[str, Any]:
+async def test_smtp(payload: dict[str, Any]) -> dict[str, Any]:
     """Send a test SMTP notification using the configured SMTP settings.
 
     Args:
@@ -103,12 +108,13 @@ def test_smtp(payload: dict[str, Any]) -> dict[str, Any]:
         HTTPException: If the SMTP configuration is incomplete.
 
     """
-    cfg = load_notify_config()
+    cfg = await load_notify_config()
     smtp = cfg.get("smtp", {})
     required = ["host", "port", "username", "password", "to_email"]
     if not all(k in smtp for k in required):
         raise HTTPException(status_code=400, detail="SMTP config incomplete.")
-    ok = send_smtp_notification(
+    ok = await asyncio.to_thread(
+        send_smtp_notification,
         smtp["host"],
         smtp["port"],
         smtp["username"],
@@ -141,7 +147,7 @@ async def test_apprise(payload: dict[str, Any]) -> dict[str, Any]:
         HTTPException: If the Apprise configuration is incomplete.
 
     """
-    cfg = load_notify_config()
+    cfg = await load_notify_config()
     apprise_cfg = cfg.get("apprise", {})
     apprise_url = apprise_cfg.get("url")
     mode = apprise_cfg.get("mode", "stateless")
@@ -151,13 +157,13 @@ async def test_apprise(payload: dict[str, Any]) -> dict[str, Any]:
     include_prefix = apprise_cfg.get("include_prefix", False)
 
     # Validate based on mode
-    if mode == "stateful":
-        if not apprise_url or not key:
-            raise HTTPException(
-                status_code=400, detail="Apprise stateful config incomplete (need URL and key)."
-            )
-    elif not apprise_url or not notify_url_string:
-        raise HTTPException(status_code=400, detail="Apprise config incomplete.")
+    if not apprise_config_valid(mode, apprise_url, key, notify_url_string):
+        raise HTTPException(
+            status_code=400,
+            detail="Apprise stateful config incomplete (need URL and key)."
+            if mode == "stateful"
+            else "Apprise config incomplete.",
+        )
 
     test_payload = {
         "event_type": payload.get("event_type", "test"),
@@ -196,7 +202,7 @@ async def test_pushover(payload: dict[str, Any]) -> dict[str, Any]:
         HTTPException: If the Pushover configuration is incomplete.
 
     """
-    cfg = load_notify_config()
+    cfg = await load_notify_config()
     pushover_cfg = cfg.get("pushover", {})
     user_key = pushover_cfg.get("user_key", "")
     api_token = pushover_cfg.get("api_token", "")

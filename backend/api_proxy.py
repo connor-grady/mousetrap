@@ -20,7 +20,7 @@ router = APIRouter()
 @router.get("/proxy_test/{label}")
 async def proxy_test(label: str) -> dict[str, Any]:
     """Test a proxy and return its proxied public IP and ASN."""
-    proxies = load_proxies()
+    proxies = await load_proxies()
     proxy_cfg = proxies.get(label)
     if not proxy_cfg:
         raise HTTPException(status_code=404, detail="Proxy not found.")
@@ -35,51 +35,51 @@ async def proxy_test(label: str) -> dict[str, Any]:
 
 
 @router.get("/proxies")
-def list_proxies() -> dict[str, Any]:
+async def list_proxies() -> dict[str, Any]:
     """List all proxy configurations."""
-    return load_proxies()
+    return await load_proxies()
 
 
 @router.post("/proxies")
-def create_proxy(proxy: dict[str, Any]) -> dict[str, Any]:
+async def create_proxy(proxy: dict[str, Any]) -> dict[str, Any]:
     """Create a new proxy configuration. Expects a dict with at least a 'label'."""
-    proxies = load_proxies()
+    proxies = await load_proxies()
     label = proxy.get("label")
     if not label:
         raise HTTPException(status_code=400, detail="Proxy label is required.")
     if label in proxies:
         raise HTTPException(status_code=400, detail="Proxy label already exists.")
     proxies[label] = proxy
-    save_proxies(proxies)
+    await save_proxies(proxies)
     return {"success": True}
 
 
 @router.put("/proxies/{label}")
-def update_proxy(label: str, proxy: dict[str, Any]) -> dict[str, Any]:
+async def update_proxy(label: str, proxy: dict[str, Any]) -> dict[str, Any]:
     """Update an existing proxy configuration."""
-    proxies = load_proxies()
+    proxies = await load_proxies()
     if label not in proxies:
         raise HTTPException(status_code=404, detail="Proxy not found.")
     proxies[label] = proxy
-    save_proxies(proxies)
+    await save_proxies(proxies)
     return {"success": True}
 
 
 @router.delete("/proxies/{label}")
-def delete_proxy(label: str) -> dict[str, Any]:
+async def delete_proxy(label: str) -> dict[str, Any]:
     """Delete a proxy configuration by label."""
-    proxies = load_proxies()
+    proxies = await load_proxies()
     if label not in proxies:
         raise HTTPException(status_code=404, detail="Proxy not found.")
     del proxies[label]
-    save_proxies(proxies)
+    await save_proxies(proxies)
     # Remove proxy reference from all sessions that use this proxy
 
-    sessions = list_sessions()
+    sessions = await list_sessions()
     for sess_label in sessions:
-        cfg = load_session(sess_label)
+        cfg = await load_session(sess_label)
         proxy_cfg = cfg.get("proxy", {})
         if isinstance(proxy_cfg, dict) and proxy_cfg.get("label") == label:
             cfg["proxy"] = {}  # Remove proxy reference
-            save_session(cfg)
+            await save_session(cfg)
     return {"success": True}

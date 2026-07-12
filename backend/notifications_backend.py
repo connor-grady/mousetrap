@@ -6,23 +6,24 @@ Pushover. Only minimal dependencies are required so these helpers can be used
 in simple automation and alerting flows.
 """
 
+import asyncio
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import logging
-import os
-from pathlib import Path
 import smtplib
 from typing import Any
 
 import aiohttp
 import yaml
 
+from backend.paths import NOTIFY_PATH
+
 _logger: logging.Logger = logging.getLogger(__name__)
-# Notification config (could be loaded from YAML or env)
-NOTIFY_CONFIG_PATH = os.environ.get("NOTIFY_CONFIG_PATH", "/config/notify.yaml")
 
 
-async def send_webhook_notification(url: str, payload: dict, discord: bool = False) -> bool:
+async def send_webhook_notification(
+    url: str, payload: dict[str, Any], discord: bool = False
+) -> bool:
     """Send a JSON webhook notification.
 
     Parameters
@@ -40,20 +41,16 @@ async def send_webhook_notification(url: str, payload: dict, discord: bool = Fal
         True when the request succeeded (HTTP 2xx), False on any exception.
     """
     timeout = aiohttp.ClientTimeout(total=10)
+    # Discord expects a {"content": ...} body; other webhooks take the raw payload.
+    body = {"content": payload.get("message") or str(payload)} if discord else payload
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            if discord:
-                # Discord expects {"content": ...}
-                data = {"content": payload.get("message") or str(payload)}
-                async with session.post(url, json=data) as resp:
-                    if resp.status >= 400:
-                        text = await resp.text()
-                        raise Exception(f"HTTP {resp.status}: {text[:200]}")
-            else:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status >= 400:
-                        text = await resp.text()
-                        raise Exception(f"HTTP {resp.status}: {text[:200]}")
+        async with (
+            aiohttp.ClientSession(timeout=timeout) as session,
+            session.post(url, json=body) as resp,
+        ):
+            if resp.status >= 400:
+                text = await resp.text()
+                raise Exception(f"HTTP {resp.status}: {text[:200]}")
     except Exception as e:
         _logger.error("[Notify] Webhook failed: %s", e)
         return False
@@ -116,10 +113,21 @@ def send_smtp_notification(
         return True
 
 
+def apprise_config_valid(mode: str, apprise_url: str, key: str, notify_url_string: str) -> bool:
+    """Return whether the Apprise config carries the fields its mode requires.
+
+    Stateful mode needs `apprise_url` and `key`; any other mode (stateless being
+    the default) needs `apprise_url` and `notify_url_string`.
+    """
+    if mode == "stateful":
+        return bool(apprise_url and key)
+    return bool(apprise_url and notify_url_string)
+
+
 async def send_apprise_notification(
     apprise_url: str,
     notify_url_string: str,
-    payload: dict,
+    payload: dict[str, Any],
     include_prefix: bool = False,
     *,
     mode: str = "stateless",
@@ -143,12 +151,12 @@ async def send_apprise_notification(
         True on success, False on failure.
     """
     # Validate required fields based on mode
-    if mode == "stateful":
-        if not key or not apprise_url:
-            _logger.error("[Notify] Apprise stateful config missing apprise_url or key")
-            return False
-    elif not notify_url_string or not apprise_url:
-        _logger.error("[Notify] Apprise config missing apprise_url or notify_url_string")
+    if not apprise_config_valid(mode, apprise_url, key, notify_url_string):
+        _logger.error(
+            "[Notify] Apprise stateful config missing apprise_url or key"
+            if mode == "stateful"
+            else "[Notify] Apprise config missing apprise_url or notify_url_string"
+        )
         return False
 
     event_type = payload.get("event_type", "Notification").replace("_", " ").title()
@@ -156,13 +164,7 @@ async def send_apprise_notification(
     title_prefix = "MouseTrap: " if include_prefix else ""
     title = f"{title_prefix}{event_type}{status}"
     message = payload.get("message", "")
-    notif_type = (
-        "success"
-        if payload.get("status") == "SUCCESS"
-        else "failure"
-        if payload.get("status") == "FAILED"
-        else "info"
-    )
+    notif_type = {"SUCCESS": "success", "FAILED": "failure"}.get(payload.get("status"), "info")
 
     try:
         apprise_base = apprise_url.rstrip("/")
@@ -266,21 +268,25 @@ async def send_pushover_notification(
         return True
 
 
-def load_notify_config() -> dict[str, Any]:
+async def load_notify_config() -> dict[str, Any]:
+    """Load the notification configuration (I/O offloaded to a worker thread)."""
+    return await asyncio.to_thread(_load_notify_config)
+
+
+def _load_notify_config() -> dict[str, Any]:
     """Load notification configuration from a YAML file.
 
-    The path is taken from the NOTIFY_CONFIG_PATH environment variable or
-    a sensible default. Returns an empty dict when the file does not exist
-    or cannot be parsed.
+    The path is ``NOTIFY_PATH`` under the config directory. Returns an empty
+    dict when the file does not exist or cannot be parsed.
 
     Returns
     -------
     dict
         Parsed YAML as a dictionary, or an empty dict on failure.
     """
-    if not Path(NOTIFY_CONFIG_PATH).exists():
+    if not NOTIFY_PATH.exists():
         return {}
-    with Path(NOTIFY_CONFIG_PATH).open(encoding="utf-8") as f:
+    with NOTIFY_PATH.open(encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
@@ -299,9 +305,9 @@ async def notify_event(
     message: summary string
     details: dict of extra info
     """
-    cfg = load_notify_config()
+    cfg = await load_notify_config()
     event_rules = cfg.get("event_rules", {})
-    rule = event_rules.get(event_type, {"email": False, "webhook": False, "apprise": False})
+    rule = event_rules.get(event_type, {})
     # Check if this notification event is explicitly disabled via the 'enabled' flag
     # If enabled is False, don't send any notifications regardless of channel settings
     if rule.get("enabled") is False:
@@ -342,7 +348,8 @@ async def notify_event(
         if all(k in smtp for k in required):
             subject = f"[MouseTrap] {event_type} - {status or ''}"
             body = f"Event: {event_type}\nLabel: {label}\nStatus: {status}\nMessage: {full_message}\nDetails: {details}"
-            send_smtp_notification(
+            await asyncio.to_thread(
+                send_smtp_notification,
                 smtp["host"],
                 smtp["port"],
                 smtp["username"],
@@ -364,18 +371,7 @@ async def notify_event(
         include_prefix = apprise_cfg.get("include_prefix", False)
 
         # Check if config is valid based on mode
-        config_valid = False
-        if (
-            mode == "stateful"
-            and apprise_url
-            and key
-            or mode == "stateless"
-            and apprise_url
-            and notify_url_string
-        ):
-            config_valid = True
-
-        if config_valid:
+        if apprise_config_valid(mode, apprise_url, key, notify_url_string):
             await send_apprise_notification(
                 apprise_url=apprise_url,
                 notify_url_string=notify_url_string,
@@ -407,7 +403,7 @@ async def safe_notify_event(*args: Any, **kwargs: Any) -> None:
     """
     try:
         await notify_event(*args, **kwargs)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         _logger.warning(
             "[Notify] safe_notify_event suppressed an unexpected error: %s: %s",
             type(e).__name__,
