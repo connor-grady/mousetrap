@@ -16,7 +16,7 @@ router = APIRouter()
 
 
 @router.get("/ui_event_log")
-def api_ui_event_log() -> list:
+def api_ui_event_log() -> list[dict[str, Any]]:
     """Retrieve the UI event log.
 
     Returns:
@@ -37,8 +37,7 @@ def api_ui_event_log_delete() -> dict[str, Any]:
         dict: {"success": True} on success, otherwise {"success": False, "error": <message>}.
 
     """
-    success = clear_ui_event_log()
-    if success:
+    if clear_ui_event_log():
         return {"success": True}
     return {"success": False, "error": "Failed to clear event log."}
 
@@ -58,7 +57,6 @@ def api_ui_event_log_delete_for_session(label: str) -> dict[str, Any]:
         dict: {"success": True} on success, otherwise {"success": False, "error": <message>}.
 
     """
-    success = clear_ui_event_log_for_session(label)
-    if success:
+    if clear_ui_event_log_for_session(label):
         return {"success": True}
     return {"success": False, "error": f"Failed to clear event log for session '{label}'."}

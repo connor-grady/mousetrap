@@ -7,20 +7,21 @@ delegate to the utilities in :mod:`backend.notifications_backend` for the
 actual sending logic.
 """
 
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 import yaml
 
 from backend.notifications_backend import (
-    NOTIFY_CONFIG_PATH,
+    AppriseMode,
+    apprise_config_valid,
     load_notify_config,
     send_apprise_notification,
     send_pushover_notification,
     send_smtp_notification,
     send_webhook_notification,
 )
+from backend.paths import NOTIFY_PATH
 
 router = APIRouter()
 
@@ -32,9 +33,8 @@ def save_notify_config(cfg: dict[str, Any]) -> None:
         cfg: Dictionary containing the notification configuration to save.
 
     """
-    path = Path(NOTIFY_CONFIG_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    NOTIFY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with NOTIFY_PATH.open("w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f)
 
 
@@ -79,11 +79,9 @@ async def test_webhook(payload: dict[str, Any]) -> dict[str, Any]:
 
     """
     cfg = load_notify_config()
-    url = cfg.get("webhook_url")
-    discord_webhook = cfg.get("discord_webhook", False)
-    if not url:
+    if not (url := cfg.get("webhook_url")):
         raise HTTPException(status_code=400, detail="Webhook URL not set.")
-    ok = await send_webhook_notification(url, payload, discord=discord_webhook)
+    ok = await send_webhook_notification(url, payload, discord=cfg.get("discord_webhook", False))
     return {"success": ok}
 
 
@@ -105,8 +103,7 @@ def test_smtp(payload: dict[str, Any]) -> dict[str, Any]:
     """
     cfg = load_notify_config()
     smtp = cfg.get("smtp", {})
-    required = ["host", "port", "username", "password", "to_email"]
-    if not all(k in smtp for k in required):
+    if not all(k in smtp for k in ("host", "port", "username", "password", "to_email")):
         raise HTTPException(status_code=400, detail="SMTP config incomplete.")
     ok = send_smtp_notification(
         smtp["host"],
@@ -144,20 +141,19 @@ async def test_apprise(payload: dict[str, Any]) -> dict[str, Any]:
     cfg = load_notify_config()
     apprise_cfg = cfg.get("apprise", {})
     apprise_url = apprise_cfg.get("url")
-    mode = apprise_cfg.get("mode", "stateless")
+    mode: AppriseMode = apprise_cfg.get("mode", "stateless")
     notify_url_string = apprise_cfg.get("notify_url_string", "")
     key = apprise_cfg.get("key", "")
     tags = apprise_cfg.get("tags", "")
     include_prefix = apprise_cfg.get("include_prefix", False)
 
-    # Validate based on mode
-    if mode == "stateful":
-        if not apprise_url or not key:
-            raise HTTPException(
-                status_code=400, detail="Apprise stateful config incomplete (need URL and key)."
-            )
-    elif not apprise_url or not notify_url_string:
-        raise HTTPException(status_code=400, detail="Apprise config incomplete.")
+    if not apprise_config_valid(mode, apprise_url, key, notify_url_string):
+        raise HTTPException(
+            status_code=400,
+            detail="Apprise stateful config incomplete (need URL and key)."
+            if mode == "stateful"
+            else "Apprise config incomplete.",
+        )
 
     test_payload = {
         "event_type": payload.get("event_type", "test"),

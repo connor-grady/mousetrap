@@ -8,14 +8,14 @@ registration (APScheduler), and related helpers.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-import inspect
 import logging
-import os
-from pathlib import Path
 import re
 import time
-from typing import Any
+from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore[import-untyped]
@@ -34,7 +34,7 @@ from backend.audiobookrequest_integration import (
     test_audiobookrequest_connection,
 )
 from backend.autobrr_integration import sync_mam_id_to_autobrr, test_autobrr_connection
-from backend.automation import run_all_automation_jobs
+from backend.automation import TriggerType, run_all_automation_jobs
 from backend.chaptarr_integration import (
     find_mam_indexer_id as find_mam_indexer_id_chaptarr,
     sync_mam_id_to_chaptarr,
@@ -48,6 +48,7 @@ from backend.config import (
     load_session,
     save_session,
 )
+from backend.env import APP_VERSION, TZ
 from backend.event_log import append_ui_event_log, clear_ui_event_log_for_session
 from backend.ip_lookup import get_asn_and_timezone_from_ip, get_ipinfo_with_fallback, get_public_ip
 from backend.jackett_integration import sync_mam_id_to_jackett, test_jackett_connection
@@ -59,6 +60,7 @@ from backend.mam_api import (
     get_status,
 )
 from backend.notifications_backend import notify_event, safe_notify_event
+from backend.paths import ASSETS_DIR, FRONTEND_BUILD_DIR, FRONTEND_DIR, FRONTEND_PUBLIC_DIR
 from backend.port_monitor import port_monitor_manager
 from backend.prowlarr_integration import (
     find_mam_indexer_id,
@@ -66,16 +68,13 @@ from backend.prowlarr_integration import (
     test_prowlarr_connection,
 )
 from backend.proxy_config import resolve_proxy_from_session_cfg
-from backend.utils import build_proxy_dict, build_status_message, extract_asn_number, setup_logging
-
-BASE_DIR = Path(__file__).resolve().parent
-FRONTEND_BUILD_DIR = (Path(BASE_DIR) / "../frontend/build").resolve()
-FRONTEND_PUBLIC_DIR = os.environ.get(
-    "FRONTEND_PUBLIC_DIR", str((Path(BASE_DIR) / "../frontend/public").resolve())
+from backend.utils import (
+    IpMonitoringMode,
+    build_proxy_dict,
+    build_status_message,
+    parse_asn,
+    setup_logging,
 )
-
-# Build output directories (Vite puts hashed assets under build/assets)
-ASSETS_DIR = Path(FRONTEND_BUILD_DIR) / "assets"
 
 # Set up global logging configuration
 setup_logging()
@@ -150,11 +149,7 @@ def should_send_notification(
     now = time.time()
     dedup_window_seconds = dedup_window_minutes * 60
 
-    # Initialize nested dict structure if needed
-    if dedup_key not in notification_dedup_cache:
-        notification_dedup_cache[dedup_key] = {}
-    if event_type not in notification_dedup_cache[dedup_key]:
-        notification_dedup_cache[dedup_key][event_type] = {}
+    notification_dedup_cache.setdefault(dedup_key, {}).setdefault(event_type, {})
 
     # Check if we've recently notified about this exact change
     last_notification_time = notification_dedup_cache[dedup_key][event_type].get(count_change_key)
@@ -203,6 +198,17 @@ def get_auto_update_val(status: dict[str, Any]) -> str:
     return str(val)
 
 
+def _inactive_count(raw: dict[str, Any], key: str) -> int:
+    """Extract the integer ``count`` for an inactivity bucket (``inactHnr``/``inactUnsat``).
+
+    Tolerates missing keys, non-dict buckets, and string counts; returns 0 for
+    anything not coercible to a non-negative integer.
+    """
+    bucket = raw.get(key)
+    value = bucket.get("count", 0) if isinstance(bucket, dict) else 0
+    return int(value) if isinstance(value, int | str) and str(value).isdigit() else 0
+
+
 async def check_and_notify_count_increments(cfg: dict, new_status: dict, label: str) -> None:
     """Check for increments in hit & run and unsatisfied counts and send notifications."""
     # Get the previous status
@@ -223,27 +229,8 @@ async def check_and_notify_count_increments(cfg: dict, new_status: dict, label: 
     dedup_key = str(uid) if uid else cfg.get("mam", {}).get("mam_id", "")
 
     # Check inactive hit & run increment
-    old_inact_hnr_raw = (
-        old_raw.get("inactHnr", {}).get("count", 0)
-        if isinstance(old_raw.get("inactHnr"), dict)
-        else 0
-    )
-    new_inact_hnr_raw = (
-        new_raw.get("inactHnr", {}).get("count", 0)
-        if isinstance(new_raw.get("inactHnr"), dict)
-        else 0
-    )
-    # Ensure values are integers for comparison
-    old_inact_hnr = (
-        int(old_inact_hnr_raw)
-        if isinstance(old_inact_hnr_raw, int | str) and str(old_inact_hnr_raw).isdigit()
-        else 0
-    )
-    new_inact_hnr = (
-        int(new_inact_hnr_raw)
-        if isinstance(new_inact_hnr_raw, int | str) and str(new_inact_hnr_raw).isdigit()
-        else 0
-    )
+    old_inact_hnr = _inactive_count(old_raw, "inactHnr")
+    new_inact_hnr = _inactive_count(new_raw, "inactHnr")
 
     if new_inact_hnr > old_inact_hnr:
         increment = new_inact_hnr - old_inact_hnr
@@ -267,27 +254,8 @@ async def check_and_notify_count_increments(cfg: dict, new_status: dict, label: 
             )
 
     # Check inactive unsatisfied increment
-    old_inact_unsat_raw = (
-        old_raw.get("inactUnsat", {}).get("count", 0)
-        if isinstance(old_raw.get("inactUnsat"), dict)
-        else 0
-    )
-    new_inact_unsat_raw = (
-        new_raw.get("inactUnsat", {}).get("count", 0)
-        if isinstance(new_raw.get("inactUnsat"), dict)
-        else 0
-    )
-    # Ensure values are integers for comparison
-    old_inact_unsat = (
-        int(old_inact_unsat_raw)
-        if isinstance(old_inact_unsat_raw, int | str) and str(old_inact_unsat_raw).isdigit()
-        else 0
-    )
-    new_inact_unsat = (
-        int(new_inact_unsat_raw)
-        if isinstance(new_inact_unsat_raw, int | str) and str(new_inact_unsat_raw).isdigit()
-        else 0
-    )
+    old_inact_unsat = _inactive_count(old_raw, "inactUnsat")
+    new_inact_unsat = _inactive_count(new_raw, "inactUnsat")
 
     if new_inact_unsat > old_inact_unsat:
         increment = new_inact_unsat - old_inact_unsat
@@ -513,8 +481,28 @@ async def keepalive_mam_session(cfg: dict[str, Any], label: str, now: datetime) 
     return classification == "ok"
 
 
+SessionType = Literal["ip", "asn"]
+
+
+async def _persist_seedbox_ip(
+    cfg: dict[str, Any], label: str, asn: int | None, now: datetime
+) -> str | None:
+    """Record a successful seedbox IP/ASN update on ``cfg``, mark the cookie valid, and persist; returns the new IP."""
+    new_ip = cfg.get("proxied_public_ip") or await get_public_ip()
+    cfg["last_seedbox_ip"] = new_ip
+    cfg["mam_ip"] = new_ip
+    cfg["last_seedbox_update"] = now.isoformat()
+    cfg["last_seedbox_asn"] = asn
+    await apply_mam_validity_classification(cfg, label, "ok", now)
+    try:
+        save_session(cfg, old_label=label)
+    except Exception as e:
+        _logger.error("[AutoUpdate][ERROR] label=%s save_session failed: %s", label, e)
+    return new_ip
+
+
 async def auto_update_seedbox_if_needed(
-    cfg: dict[str, Any], label: str, ip_to_use: str | None, asn: str | None, now: datetime
+    cfg: dict[str, Any], label: str, ip_to_use: str | None, asn: int | None, now: datetime
 ) -> tuple[bool, dict[str, Any] | None]:
     """Check whether a seedbox auto-update should be performed and perform it.
 
@@ -522,7 +510,7 @@ async def auto_update_seedbox_if_needed(
         cfg: Session configuration dict.
         label: Session label string.
         ip_to_use: IP address to compare/update.
-        asn: ASN value associated with the IP (string or None).
+        asn: ASN number associated with the IP (int or None).
         now: Current datetime (UTC).
 
     Returns:
@@ -533,9 +521,9 @@ async def auto_update_seedbox_if_needed(
     """
     if not ip_to_use:
         return False, None
-    session_type = cfg.get("mam", {}).get("session_type", "").lower()  # 'ip locked' or 'asn locked'
+    session_type: SessionType | None = cfg.get("mam", {}).get("session_type")
     last_seedbox_ip: str | None = cfg.get("last_seedbox_ip")
-    last_seedbox_asn: str | None = cfg.get("last_seedbox_asn")
+    last_seedbox_asn: int | None = parse_asn(cfg.get("last_seedbox_asn"))
     last_seedbox_update = cfg.get("last_seedbox_update")
     mam_id: str = cfg.get("mam", {}).get("mam_id", "")
     # Do not log mam_id value
@@ -550,7 +538,7 @@ async def auto_update_seedbox_if_needed(
     # Only trigger update if something changed (IP or ASN)
 
     # If ASN-locked and ASN changed but IP did not, update ASN in config only
-    if session_type == "asn locked":
+    if session_type == "asn":
         # Always get ASN using proxy if available
         proxied_ip = cfg.get("proxied_public_ip")
         proxy_cfg = resolve_proxy_from_session_cfg(cfg)
@@ -567,15 +555,14 @@ async def auto_update_seedbox_if_needed(
             # Don't return an error - just skip ASN comparison for this check
             # Continue with normal processing without ASN change detection
         else:
-            norm_last = extract_asn_number(last_seedbox_asn) if last_seedbox_asn else None
-            norm_check = extract_asn_number(asn_to_check) if "asn_to_check" in locals() else None
+            norm_check = parse_asn(asn_to_check)
             # Always store the normalized ASN number if available
             if norm_check is not None:
                 cfg["last_seedbox_asn"] = norm_check
                 save_session(cfg, old_label=label)
             # Log ASN compare and result at INFO level
-            if norm_last != norm_check:
-                reason = f"ASN changed: {norm_last} -> {norm_check}"
+            if last_seedbox_asn != norm_check:
+                reason = f"ASN changed: {last_seedbox_asn} -> {norm_check}"
                 _logger.info(
                     "[AutoUpdate] label=%s ASN changed. Will check for errors when updating IP. reason=%s",
                     label,
@@ -588,7 +575,7 @@ async def auto_update_seedbox_if_needed(
                 _logger.info(
                     "[AutoUpdate] label=%s ASN check: %s -> %s | No change needed",
                     label,
-                    norm_last,
+                    last_seedbox_asn,
                     norm_check,
                 )
     # For proxied sessions, use proxied IP; for non-proxied, use detected public IP
@@ -707,25 +694,7 @@ async def auto_update_seedbox_if_needed(
                     )
 
                 if resp.status == 200 and result.get("Success"):
-                    # Update last_seedbox_ip and mam_ip to the new detected/proxied IP
-                    proxied_ip = cfg.get("proxied_public_ip")
-                    if proxied_ip:
-                        new_ip = proxied_ip
-                    else:
-                        new_ip = await get_public_ip()
-                    cfg["last_seedbox_ip"] = new_ip
-                    cfg["mam_ip"] = new_ip
-                    cfg["last_seedbox_update"] = now.isoformat()
-                    cfg["last_seedbox_asn"] = asn
-                    await apply_mam_validity_classification(cfg, label, "ok", now)
-                    try:
-                        save_session(cfg, old_label=label)
-                    except Exception as e:
-                        _logger.error(
-                            "[AutoUpdate][ERROR] label=%s save_session failed: %s",
-                            label,
-                            e,
-                        )
+                    new_ip = await _persist_seedbox_ip(cfg, label, asn, now)
                     _logger.info(
                         "[AutoUpdate] label=%s result=success reason=%s",
                         label,
@@ -743,22 +712,7 @@ async def auto_update_seedbox_if_needed(
                     )
                     return True, {"success": True, "msg": api_msg, "reason": reason}
                 if resp.status == 200 and result.get("msg") == "No change":
-                    proxied_ip = cfg.get("proxied_public_ip")
-                    if proxied_ip:
-                        new_ip = proxied_ip
-                    else:
-                        new_ip = await get_public_ip()
-                    cfg["last_seedbox_ip"] = new_ip
-                    cfg["mam_ip"] = new_ip
-                    cfg["last_seedbox_update"] = now.isoformat()
-                    cfg["last_seedbox_asn"] = asn
-                    await apply_mam_validity_classification(cfg, label, "ok", now)
-                    try:
-                        save_session(cfg, old_label=label)
-                    except Exception as e:
-                        _logger.error(
-                            "[AutoUpdate][ERROR] label=%s save_session failed: %s", label, e
-                        )
+                    await _persist_seedbox_ip(cfg, label, asn, now)
                     _logger.info(
                         "[AutoUpdate] label=%s result=no_change reason=%s",
                         label,
@@ -824,11 +778,11 @@ async def auto_update_seedbox_if_needed(
                     )
 
                 # Check if this is an ASN mismatch issue for ASN Locked sessions
-                if session_type == "asn locked" and (
+                if session_type == "asn" and (
                     "Invalid session" in error_msg or resp.status == 403
                 ):
                     # Check if ASN has changed recently
-                    current_asn = asn or cfg.get("proxied_public_ip_asn")
+                    current_asn = asn or parse_asn(cfg.get("proxied_public_ip_asn"))
                     if current_asn and last_seedbox_asn and current_asn != last_seedbox_asn:
                         enhanced_msg = (
                             f"{error_msg}\n\n"
@@ -923,9 +877,7 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
     detected_public_ip = detected_ipinfo_data.get("ip")
     detected_public_ip_asn = None
     if detected_public_ip:
-        asn_full_pub = detected_ipinfo_data.get("asn")
-        match_pub = re.search(r"(AS)?(\d+)", asn_full_pub or "") if asn_full_pub else None
-        detected_public_ip_asn = match_pub.group(2) if match_pub else asn_full_pub
+        detected_public_ip_asn = parse_asn(detected_ipinfo_data.get("asn"))
 
     cfg = load_session(label) if label else None
     if cfg is None:
@@ -964,9 +916,7 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
             proxied_ipinfo_data = await get_ipinfo_with_fallback(proxy_cfg=proxy_cfg)
             proxied_public_ip = proxied_ipinfo_data.get("ip")
             asn_full_proxied = proxied_ipinfo_data.get("asn")
-            asn_str = str(asn_full_proxied) if asn_full_proxied is not None else ""
-            match_proxied = re.search(r"(AS)?(\d+)", asn_str) if asn_str else None
-            proxied_public_ip_asn = match_proxied.group(2) if match_proxied else asn_str
+            proxied_public_ip_asn = parse_asn(asn_full_proxied)
             proxied_public_ip_as = asn_full_proxied
             # Save to config if changed
             if proxied_public_ip and cfg.get("proxied_public_ip") != proxied_public_ip:
@@ -1003,7 +953,7 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
     cfg = load_session(label)
     mam_id = cfg.get("mam", {}).get("mam_id", "")
     mam_ip_override = cfg.get("mam_ip", "").strip()
-    ip_monitoring_mode = cfg.get("mam", {}).get("ip_monitoring_mode", "auto")
+    ip_monitoring_mode: IpMonitoringMode = cfg.get("mam", {}).get("ip_monitoring_mode", "auto")
 
     # Note: IP detection always happens for user convenience, regardless of monitoring mode
     # Only the monitoring/auto-update logic differs between modes
@@ -1025,15 +975,13 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
     ip_to_use: str | None = mam_ip_override or proxied_public_ip or detected_public_ip
     # Get ASN for configured IP
     asn_full, _ = await get_asn_and_timezone_from_ip(ip_to_use) if ip_to_use else (None, None)
-    match = re.search(r"(AS)?(\d+)", asn_full or "") if asn_full else None
-    asn = match.group(2) if match else asn_full
+    asn = parse_asn(asn_full)
     mam_session_as = asn_full
     # Also get MAM's perspective for display only
     mam_seen = await get_mam_seen_ip_info(mam_id, proxy_cfg=proxy_cfg or {})
     mam_seen_asn = str(mam_seen.get("ASN")) if mam_seen.get("ASN") is not None else None
     mam_seen_as = mam_seen.get("AS")
-    tz_env = os.environ.get("TZ")
-    timezone_used = tz_env if tz_env else "UTC"
+    timezone_used = TZ
     now = datetime.now(UTC)
     # Remove timer persistence: do not use session file for last_check_time
     cache = session_status_cache.get(label, {})
@@ -1045,8 +993,7 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
     detected_public_ip_as = None
     if detected_public_ip:
         asn_full_pub, _ = await get_asn_and_timezone_from_ip(detected_public_ip)
-        match_pub = re.search(r"(AS)?(\d+)", asn_full_pub or "") if asn_full_pub else None
-        detected_public_ip_asn = match_pub.group(2) if match_pub else asn_full_pub
+        detected_public_ip_asn = parse_asn(asn_full_pub)
         detected_public_ip_as = asn_full_pub
     # If session has never been checked (no last_status and not forced), return not configured
     if not force and (
@@ -1062,6 +1009,39 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
                 "next_check_time": None,
                 "details": {},
             }
+
+    def _status_payload(
+        *, next_check_time: str | None, status_message: Any, **extra: Any
+    ) -> dict[str, Any]:
+        """Assemble the /api/status response body shared by the cached and fresh-check paths."""
+        return {
+            "mam_cookie_exists": status.get("mam_cookie_exists"),
+            "points": status.get("points"),
+            "wedge_active": status.get("wedge_active"),
+            "vip_active": status.get("vip_active"),
+            "current_ip": ip_to_use,
+            "current_ip_asn": asn,
+            "mam_session_as": mam_session_as,
+            "mam_seen_asn": mam_seen_asn,
+            "mam_seen_as": mam_seen_as,
+            "configured_ip": ip_to_use,
+            "configured_asn": asn,
+            "check_freq": check_freq_minutes,
+            "last_check_time": last_check_time,
+            "next_check_time": next_check_time,
+            "status_message": status_message,
+            "details": status,
+            "detected_public_ip": detected_public_ip,
+            "detected_public_ip_asn": detected_public_ip_asn,
+            "detected_public_ip_as": detected_public_ip_as,
+            "proxied_public_ip": proxied_public_ip,
+            "proxied_public_ip_asn": proxied_public_ip_asn,
+            "proxied_public_ip_as": proxied_public_ip_as,
+            "ip_monitoring_mode": ip_monitoring_mode,
+            "last_mam_valid_check": cfg.get("last_mam_valid_check"),
+            "mam_invalid_since": cfg.get("mam_invalid_since"),
+            **extra,
+        }
 
     # If we have cached data and not forcing, use it and calculate next_check_time
     if not force and status:
@@ -1081,36 +1061,13 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
             next_check_time = next_check_dt.isoformat()
 
         # Return cached status with calculated timing
-        return {
-            "mam_cookie_exists": status.get("mam_cookie_exists"),
-            "points": status.get("points"),
-            "wedge_active": status.get("wedge_active"),
-            "vip_active": status.get("vip_active"),
-            "current_ip": ip_to_use,
-            "current_ip_asn": asn,
-            "mam_session_as": mam_session_as,
-            "mam_seen_asn": mam_seen_asn,
-            "mam_seen_as": mam_seen_as,
-            "configured_ip": ip_to_use,
-            "configured_asn": asn,
-            "mam_id": mam_id,
-            "check_freq": check_freq_minutes,
-            "last_check_time": last_check_time,
-            "next_check_time": next_check_time,
-            "configured": True,
-            "status_message": status.get("status_message", "OK"),
-            "auto_update_seedbox": status.get("auto_update_seedbox"),
-            "details": status,
-            "detected_public_ip": detected_public_ip,
-            "detected_public_ip_asn": detected_public_ip_asn,
-            "detected_public_ip_as": detected_public_ip_as,
-            "proxied_public_ip": proxied_public_ip,
-            "proxied_public_ip_asn": proxied_public_ip_asn,
-            "proxied_public_ip_as": proxied_public_ip_as,
-            "ip_monitoring_mode": ip_monitoring_mode,
-            "last_mam_valid_check": cfg.get("last_mam_valid_check"),
-            "mam_invalid_since": cfg.get("mam_invalid_since"),
-        }
+        return _status_payload(
+            next_check_time=next_check_time,
+            status_message=status.get("status_message", "OK"),
+            mam_id=mam_id,
+            configured=True,
+            auto_update_seedbox=status.get("auto_update_seedbox"),
+        )
 
     if force or not status:
         # Always reload session config and resolve proxy before every real check
@@ -1202,17 +1159,16 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
     ):
         safe_status = status if isinstance(status, dict) else {}
         prev_ip = cfg.get("last_seedbox_ip")
-        prev_asn = cfg.get("last_seedbox_asn")
+        prev_asn = parse_asn(cfg.get("last_seedbox_asn"))
         proxied_ip = cfg.get("proxied_public_ip")
         mam_ip_override = cfg.get("mam_ip", "").strip()
         detected_ip = detected_public_ip
         curr_ip = mam_ip_override or proxied_ip or detected_ip
         asn_full, _ = await get_asn_and_timezone_from_ip(curr_ip) if curr_ip else (None, None)
-        match = re.search(r"(AS)?(\d+)", asn_full or "") if asn_full else None
-        curr_asn = match.group(2) if match else asn_full
+        curr_asn = parse_asn(asn_full)
 
         # Handle None ASN gracefully - if we can't determine ASN, preserve previous value for comparison
-        if curr_asn is None or curr_asn == "Unknown ASN":
+        if curr_asn is None:
             curr_asn = prev_asn  # Use previous ASN to avoid false change notifications
 
         event_status_message = None
@@ -1345,36 +1301,13 @@ async def api_status(label: str = Query(None), force: int = Query(0)) -> dict[st
             next_check_time_val = next_check_dt.isoformat()
         else:
             next_check_time_val = cached_next_check_time
-    return {
-        "mam_cookie_exists": status.get("mam_cookie_exists"),
-        "points": status.get("points"),
-        "wedge_active": status.get("wedge_active"),
-        "vip_active": status.get("vip_active"),
-        "current_ip": ip_to_use,
-        "current_ip_asn": asn,
-        "mam_session_as": mam_session_as,
-        "configured_ip": ip_to_use,
-        "configured_asn": asn,
-        "mam_seen_asn": mam_seen_asn,
-        "mam_seen_as": mam_seen_as,
-        "detected_public_ip": detected_public_ip,
-        "detected_public_ip_asn": detected_public_ip_asn,
-        "detected_public_ip_as": detected_public_ip_as,
-        "proxied_public_ip": proxied_public_ip,
-        "proxied_public_ip_asn": proxied_public_ip_asn,
-        "proxied_public_ip_as": proxied_public_ip_as,
-        "ip_monitoring_mode": ip_monitoring_mode,
-        "ip_source": "configured",
-        "message": status.get("message", "Please provide your MaM ID in the configuration."),
-        "last_check_time": last_check_time,
-        "next_check_time": next_check_time_val,
-        "timezone": timezone_used,
-        "check_freq": check_freq_minutes,
-        "status_message": status.get("status_message"),
-        "details": status,
-        "last_mam_valid_check": cfg.get("last_mam_valid_check"),
-        "mam_invalid_since": cfg.get("mam_invalid_since"),
-    }
+    return _status_payload(
+        next_check_time=next_check_time_val,
+        status_message=status.get("status_message"),
+        ip_source="configured",
+        message=status.get("message", "Please provide your MaM ID in the configuration."),
+        timezone=timezone_used,
+    )
 
 
 @app.post("/api/session/refresh")
@@ -1419,35 +1352,116 @@ def api_load_session(label: str) -> dict[str, Any]:
     return cfg
 
 
+@dataclass(frozen=True)
+class _IndexerService:
+    """One MAM-ID-syncable indexer integration."""
+
+    name: str
+    cfg_key: str
+    sync: Callable[[dict[str, Any], str], Awaitable[dict[str, Any]]]
+
+
+async def _sync_jackett(cfg: dict[str, Any], mam_id: str) -> dict[str, Any]:
+    """Adapt Jackett's host/port/key config to the common (cfg, mam_id) sync interface."""
+    jc = cfg.get("jackett", {})
+    host = jc.get("host", "").strip()
+    port = jc.get("port", 9117)
+    api_key = jc.get("api_key", "").strip()
+    admin_password = jc.get("admin_password", "").strip()
+    if not all([host, port, api_key]):
+        return {"success": False, "error": "incomplete configuration"}
+    return await sync_mam_id_to_jackett(host, port, api_key, admin_password, mam_id)
+
+
+async def _sync_audiobookrequest(cfg: dict[str, Any], mam_id: str) -> dict[str, Any]:
+    """Adapt AudioBookRequest's host/port/key config to the common sync interface."""
+    ac = cfg.get("audiobookrequest", {})
+    host = ac.get("host", "").strip()
+    port = ac.get("port", 3000)
+    api_key = ac.get("api_key", "").strip()
+    if not all([host, port, api_key]):
+        return {"success": False, "error": "incomplete configuration"}
+    return await sync_mam_id_to_audiobookrequest(host, port, api_key, mam_id)
+
+
+async def _sync_autobrr(cfg: dict[str, Any], mam_id: str) -> dict[str, Any]:
+    """Adapt Autobrr's host/port/key config to the common sync interface."""
+    ac = cfg.get("autobrr", {})
+    host = ac.get("host", "").strip()
+    port = ac.get("port", 7474)
+    api_key = ac.get("api_key", "").strip()
+    if not all([host, port, api_key]):
+        return {"success": False, "error": "incomplete configuration"}
+    return await sync_mam_id_to_autobrr(host, port, api_key, mam_id)
+
+
+_INDEXER_SERVICES: list[_IndexerService] = [
+    _IndexerService("Prowlarr", "prowlarr", sync_mam_id_to_prowlarr),
+    _IndexerService("Chaptarr", "chaptarr", sync_mam_id_to_chaptarr),
+    _IndexerService("Jackett", "jackett", _sync_jackett),
+    _IndexerService("AudioBookRequest", "audiobookrequest", _sync_audiobookrequest),
+    _IndexerService("Autobrr", "autobrr", _sync_autobrr),
+]
+
+
+async def _sync_indexers(
+    cfg: dict[str, Any],
+    mam_id: str,
+    label: str,
+    *,
+    require_auto_update_on_save: bool,
+    verbose: bool,
+    prev_mam_id: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Sync `mam_id` to every enabled indexer service, returning (updated, failed) names.
+
+    `require_auto_update_on_save` additionally gates each service on its
+    `auto_update_on_save` flag; `verbose` emits per-service info/warning logs.
+    """
+    updated: list[str] = []
+    failed: list[str] = []
+    for svc in _INDEXER_SERVICES:
+        svc_cfg = cfg.get(svc.cfg_key, {})
+        enabled = svc_cfg.get("enabled")
+        if require_auto_update_on_save:
+            enabled = enabled and svc_cfg.get("auto_update_on_save")
+        if not enabled:
+            continue
+        if verbose:
+            _logger.info(
+                "[%s] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
+                svc.name,
+                label,
+                prev_mam_id,
+                mam_id,
+            )
+        try:
+            result = await svc.sync(cfg, mam_id)
+            if result.get("success"):
+                if verbose:
+                    _logger.info("[%s] Auto-update successful: %s", svc.name, result.get("message"))
+                updated.append(svc.name)
+            else:
+                detail = result.get("error") or result.get("message") or "Unknown error"
+                if verbose:
+                    _logger.warning("[%s] Auto-update failed: %s", svc.name, detail)
+                failed.append(f"{svc.name} ({detail})")
+        except Exception as e:
+            _logger.error("[%s] MAM ID sync error for session '%s': %s", svc.name, label, e)
+            failed.append(f"{svc.name} ({e!s})")
+    return updated, failed
+
+
 async def _sync_integrations_if_mam_id_changed(
     cfg: dict[str, Any], label: str, new_mam_id: str | None, prev_mam_id: str | None
 ) -> None:
     """Push updated mam_id to all enabled integrations when it has changed."""
-    prowlarr_cfg = cfg.get("prowlarr", {})
-    chaptarr_cfg = cfg.get("chaptarr", {})
-    jackett_cfg = cfg.get("jackett", {})
-    audiobookrequest_cfg = cfg.get("audiobookrequest", {})
-    autobrr_cfg = cfg.get("autobrr", {})
-
-    prowlarr_enabled = prowlarr_cfg.get("enabled") and prowlarr_cfg.get("auto_update_on_save")
-    chaptarr_enabled = chaptarr_cfg.get("enabled") and chaptarr_cfg.get("auto_update_on_save")
-    jackett_enabled = jackett_cfg.get("enabled") and jackett_cfg.get("auto_update_on_save")
-    audiobookrequest_enabled = audiobookrequest_cfg.get("enabled") and audiobookrequest_cfg.get(
-        "auto_update_on_save"
+    any_enabled = any(
+        cfg.get(svc.cfg_key, {}).get("enabled")
+        and cfg.get(svc.cfg_key, {}).get("auto_update_on_save")
+        for svc in _INDEXER_SERVICES
     )
-    autobrr_enabled = autobrr_cfg.get("enabled") and autobrr_cfg.get("auto_update_on_save")
-
-    if not (
-        (
-            prowlarr_enabled
-            or chaptarr_enabled
-            or jackett_enabled
-            or audiobookrequest_enabled
-            or autobrr_enabled
-        )
-        and new_mam_id
-        and new_mam_id != prev_mam_id
-    ):
+    if not (any_enabled and new_mam_id and new_mam_id != prev_mam_id):
         if new_mam_id == prev_mam_id:
             _logger.debug(
                 "[Indexers] Auto-update skipped for session '%s' (MAM ID unchanged: %s)",
@@ -1461,121 +1475,14 @@ async def _sync_integrations_if_mam_id_changed(
             )
         return
 
-    updated_services = []
-    failed_services = []
-
-    # Update Prowlarr if enabled
-    if prowlarr_enabled:
-        try:
-            _logger.info(
-                "[Prowlarr] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
-                label,
-                prev_mam_id,
-                new_mam_id,
-            )
-            result = await sync_mam_id_to_prowlarr(cfg, new_mam_id)
-            if result.get("success"):
-                _logger.info("[Prowlarr] Auto-update successful: %s", result.get("message"))
-                updated_services.append("Prowlarr")
-            else:
-                _logger.warning("[Prowlarr] Auto-update failed: %s", result.get("message"))
-                failed_services.append(f"Prowlarr ({result.get('message')})")
-        except Exception as e:
-            _logger.error("[Prowlarr] Auto-update error for session '%s': %s", label, e)
-            failed_services.append(f"Prowlarr ({e!s})")
-
-    # Update Chaptarr if enabled
-    if chaptarr_enabled:
-        try:
-            _logger.info(
-                "[Chaptarr] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
-                label,
-                prev_mam_id,
-                new_mam_id,
-            )
-            result = await sync_mam_id_to_chaptarr(cfg, new_mam_id)
-            if result.get("success"):
-                _logger.info("[Chaptarr] Auto-update successful: %s", result.get("message"))
-                updated_services.append("Chaptarr")
-            else:
-                _logger.warning("[Chaptarr] Auto-update failed: %s", result.get("message"))
-                failed_services.append(f"Chaptarr ({result.get('message')})")
-        except Exception as e:
-            _logger.error("[Chaptarr] Auto-update error for session '%s': %s", label, e)
-            failed_services.append(f"Chaptarr ({e!s})")
-
-    # Update Jackett if enabled
-    if jackett_enabled:
-        try:
-            _logger.info(
-                "[Jackett] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
-                label,
-                prev_mam_id,
-                new_mam_id,
-            )
-            host = jackett_cfg.get("host", "").strip()
-            port = jackett_cfg.get("port", 9117)
-            api_key = jackett_cfg.get("api_key", "").strip()
-            admin_password = jackett_cfg.get("admin_password", "").strip()
-            result = await sync_mam_id_to_jackett(host, port, api_key, admin_password, new_mam_id)
-            if result.get("success"):
-                _logger.info("[Jackett] Auto-update successful: %s", result.get("message"))
-                updated_services.append("Jackett")
-            else:
-                error_msg = result.get("error", "Unknown error")
-                _logger.warning("[Jackett] Auto-update failed: %s", error_msg)
-                failed_services.append(f"Jackett ({error_msg})")
-        except Exception as e:
-            _logger.error("[Jackett] Auto-update error for session '%s': %s", label, e)
-            failed_services.append(f"Jackett ({e!s})")
-
-    # Update AudioBookRequest if enabled
-    if audiobookrequest_enabled:
-        try:
-            _logger.info(
-                "[AudioBookRequest] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
-                label,
-                prev_mam_id,
-                new_mam_id,
-            )
-            host = audiobookrequest_cfg.get("host", "").strip()
-            port = audiobookrequest_cfg.get("port", 3000)
-            api_key = audiobookrequest_cfg.get("api_key", "").strip()
-            result = await sync_mam_id_to_audiobookrequest(host, port, api_key, new_mam_id)
-            if result.get("success"):
-                _logger.info("[AudioBookRequest] Auto-update successful: %s", result.get("message"))
-                updated_services.append("AudioBookRequest")
-            else:
-                error_msg = result.get("error", "Unknown error")
-                _logger.warning("[AudioBookRequest] Auto-update failed: %s", error_msg)
-                failed_services.append(f"AudioBookRequest ({error_msg})")
-        except Exception as e:
-            _logger.error("[AudioBookRequest] Auto-update error for session '%s': %s", label, e)
-            failed_services.append(f"AudioBookRequest ({e!s})")
-
-    # Update Autobrr if enabled
-    if autobrr_enabled:
-        try:
-            _logger.info(
-                "[Autobrr] Auto-update triggered for session '%s' (MAM ID changed: %s -> %s)",
-                label,
-                prev_mam_id,
-                new_mam_id,
-            )
-            host = autobrr_cfg.get("host", "").strip()
-            port = autobrr_cfg.get("port", 7474)
-            api_key = autobrr_cfg.get("api_key", "").strip()
-            result = await sync_mam_id_to_autobrr(host, port, api_key, new_mam_id)
-            if result.get("success"):
-                _logger.info("[Autobrr] Auto-update successful: %s", result.get("message"))
-                updated_services.append("Autobrr")
-            else:
-                error_msg = result.get("error", "Unknown error")
-                _logger.warning("[Autobrr] Auto-update failed: %s", error_msg)
-                failed_services.append(f"Autobrr ({error_msg})")
-        except Exception as e:
-            _logger.error("[Autobrr] Auto-update error for session '%s': %s", label, e)
-            failed_services.append(f"Autobrr ({e!s})")
+    updated_services, failed_services = await _sync_indexers(
+        cfg,
+        new_mam_id,
+        label,
+        require_auto_update_on_save=True,
+        verbose=True,
+        prev_mam_id=prev_mam_id,
+    )
 
     # Log event with detailed message
     if updated_services:
@@ -1603,6 +1510,17 @@ async def _sync_integrations_if_mam_id_changed(
         )
 
 
+def _load_prev_session(old_label: str | None, label: str | None) -> dict[str, Any] | None:
+    """Load the previous session config by ``old_label`` (preferred) or ``label``; None on any failure."""
+    target = old_label or label
+    if not target:
+        return None
+    try:
+        return load_session(target)
+    except Exception:
+        return None
+
+
 @app.post("/api/session/save")
 async def api_save_session(request: Request) -> dict[str, Any]:
     """Save or update a session configuration.
@@ -1620,16 +1538,7 @@ async def api_save_session(request: Request) -> dict[str, Any]:
         prev_cfg = None
 
         if "proxy" in cfg:
-            if old_label:
-                try:
-                    prev_cfg = load_session(old_label)
-                except Exception:
-                    prev_cfg = None
-            elif cfg.get("label"):
-                try:
-                    prev_cfg = load_session(cfg["label"])
-                except Exception:
-                    prev_cfg = None
+            prev_cfg = _load_prev_session(old_label, cfg.get("label"))
             # If password is missing but previous session had one, keep it
             if (
                 isinstance(proxy_cfg, dict)
@@ -1660,16 +1569,7 @@ async def api_save_session(request: Request) -> dict[str, Any]:
         ]
         # If prev_cfg not set above, try to load it now
         if prev_cfg is None:
-            if old_label:
-                try:
-                    prev_cfg = load_session(old_label)
-                except Exception:
-                    prev_cfg = None
-            elif cfg.get("label"):
-                try:
-                    prev_cfg = load_session(cfg["label"])
-                except Exception:
-                    prev_cfg = None
+            prev_cfg = _load_prev_session(old_label, cfg.get("label"))
         if prev_cfg:
             for field in backend_fields:
                 if field in prev_cfg and field not in cfg:
@@ -1677,7 +1577,7 @@ async def api_save_session(request: Request) -> dict[str, Any]:
 
         label = cfg.get("label")
         session_path = get_session_path(label)
-        is_new = not Path(session_path).exists()
+        is_new = not session_path.exists()
 
         if is_new:
             # Clear any old event log entries for this session label
@@ -1801,7 +1701,7 @@ async def api_save_perkautomation(request: Request) -> dict[str, Any]:
             """
             auto = new_pa.get(automation_key, {})
             enabled = auto.get("enabled", False)
-            trigger_type = auto.get("trigger_type", "time")
+            trigger_type: TriggerType = auto.get("trigger_type", "time")
             # Map automation_key to new timestamp field
             ts_field = None
             if automation_key == "upload_credit":
@@ -1878,10 +1778,9 @@ async def api_update_seedbox(request: Request) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail="Session mam_ip (entered IP) is required.")
         ip_to_use = mam_ip_override
         asn_full, _ = await get_asn_and_timezone_from_ip(ip_to_use)
-        match = re.search(r"(AS)?(\d+)", asn_full or "") if asn_full else None
-        asn = match.group(2) if match else asn_full
+        asn = parse_asn(asn_full)
         last_seedbox_ip = cfg.get("last_seedbox_ip")
-        last_seedbox_asn = cfg.get("last_seedbox_asn")
+        last_seedbox_asn = parse_asn(cfg.get("last_seedbox_asn"))
         last_seedbox_update = cfg.get("last_seedbox_update")
         now = datetime.now(UTC)
         update_needed = (ip_to_use != last_seedbox_ip) or (asn != last_seedbox_asn)
@@ -2023,17 +1922,17 @@ async def api_test_asn_notifications(request: Request) -> dict[str, Any]:
         if not cfg:
             return {"success": False, "message": f"Session '{label}' not found"}
 
-        session_type = cfg.get("mam", {}).get("session_type", "").lower()
+        session_type: SessionType | None = cfg.get("mam", {}).get("session_type")
 
-        if session_type != "asn locked":
+        if session_type != "asn":
             return {
                 "success": False,
                 "message": f"Session '{label}' is not ASN Locked (current type: {session_type}). ASN notifications only apply to ASN Locked sessions.",
             }
 
         # Simulate ASN values
-        old_asn = "11878"
-        new_asn = "63018"
+        old_asn = 11878
+        new_asn = 63018
 
         # Test ASN Mismatch on 403 Error notification
         enhanced_msg = (
@@ -2356,10 +2255,10 @@ async def api_jackett_update(request: Request) -> dict[str, Any]:
         api_key = jackett_cfg.get("api_key", "").strip()
         admin_password = jackett_cfg.get("admin_password", "").strip()
 
-        if not all([host, port, api_key, admin_password]):
+        if not all([host, port, api_key]):
             return {
                 "success": False,
-                "message": "Jackett configuration incomplete (host, port, api_key, admin_password required)",
+                "message": "Jackett configuration incomplete (host, port, api_key required)",
             }
 
         result = await sync_mam_id_to_jackett(host, port, api_key, admin_password, mam_id)
@@ -2583,122 +2482,15 @@ async def api_indexer_update(request: Request) -> dict[str, Any]:
                 "message": "MAM ID not configured in session and not provided",
             }
 
-        prowlarr_cfg = cfg.get("prowlarr", {})
-        chaptarr_cfg = cfg.get("chaptarr", {})
-        jackett_cfg = cfg.get("jackett", {})
-        audiobookrequest_cfg = cfg.get("audiobookrequest", {})
-        autobrr_cfg = cfg.get("autobrr", {})
-
-        prowlarr_enabled = prowlarr_cfg.get("enabled", False)
-        chaptarr_enabled = chaptarr_cfg.get("enabled", False)
-        jackett_enabled = jackett_cfg.get("enabled", False)
-        audiobookrequest_enabled = audiobookrequest_cfg.get("enabled", False)
-        autobrr_enabled = autobrr_cfg.get("enabled", False)
-
-        if (
-            not prowlarr_enabled
-            and not chaptarr_enabled
-            and not jackett_enabled
-            and not audiobookrequest_enabled
-            and not autobrr_enabled
-        ):
+        if not any(cfg.get(svc.cfg_key, {}).get("enabled") for svc in _INDEXER_SERVICES):
             return {
                 "success": False,
                 "message": "No indexer integrations are enabled for this session",
             }
 
-        updated_services = []
-        failed_services = []
-
-        # Update Prowlarr if enabled
-        if prowlarr_enabled:
-            try:
-                result = await sync_mam_id_to_prowlarr(cfg, mam_id)
-                if result.get("success"):
-                    updated_services.append("Prowlarr")
-                else:
-                    failed_services.append(f"Prowlarr ({result.get('message')})")
-            except Exception as e:
-                _logger.error("[Prowlarr] Update error for session '%s': %s", label, e)
-                failed_services.append(f"Prowlarr ({e!s})")
-
-        # Update Chaptarr if enabled
-        if chaptarr_enabled:
-            try:
-                result = await sync_mam_id_to_chaptarr(cfg, mam_id)
-                if result.get("success"):
-                    updated_services.append("Chaptarr")
-                else:
-                    failed_services.append(f"Chaptarr ({result.get('message')})")
-            except Exception as e:
-                _logger.error("[Chaptarr] Update error for session '%s': %s", label, e)
-                failed_services.append(f"Chaptarr ({e!s})")
-
-        # Update Jackett if enabled
-        if jackett_enabled:
-            try:
-                host = jackett_cfg.get("host", "").strip()
-                port = jackett_cfg.get("port", 9117)
-                api_key = jackett_cfg.get("api_key", "").strip()
-                admin_password = jackett_cfg.get("admin_password", "").strip()
-
-                if not all([host, port, api_key, admin_password]):
-                    failed_services.append("Jackett (incomplete configuration)")
-                else:
-                    result = await sync_mam_id_to_jackett(
-                        host, port, api_key, admin_password, mam_id
-                    )
-                    if result.get("success"):
-                        updated_services.append("Jackett")
-                    else:
-                        failed_services.append(
-                            f"Jackett ({result.get('error', result.get('message'))})"
-                        )
-            except Exception as e:
-                _logger.error("[Jackett] Update error for session '%s': %s", label, e)
-                failed_services.append(f"Jackett ({e!s})")
-
-        # Update AudioBookRequest if enabled
-        if audiobookrequest_enabled:
-            try:
-                host = audiobookrequest_cfg.get("host", "").strip()
-                port = audiobookrequest_cfg.get("port", 3000)
-                api_key = audiobookrequest_cfg.get("api_key", "").strip()
-
-                if not all([host, port, api_key]):
-                    failed_services.append("AudioBookRequest (incomplete configuration)")
-                else:
-                    result = await sync_mam_id_to_audiobookrequest(host, port, api_key, mam_id)
-                    if result.get("success"):
-                        updated_services.append("AudioBookRequest")
-                    else:
-                        failed_services.append(
-                            f"AudioBookRequest ({result.get('error', result.get('message'))})"
-                        )
-            except Exception as e:
-                _logger.error("[AudioBookRequest] Update error for session '%s': %s", label, e)
-                failed_services.append(f"AudioBookRequest ({e!s})")
-
-        # Update Autobrr if enabled
-        if autobrr_enabled:
-            try:
-                host = autobrr_cfg.get("host", "").strip()
-                port = autobrr_cfg.get("port", 7474)
-                api_key = autobrr_cfg.get("api_key", "").strip()
-
-                if not all([host, port, api_key]):
-                    failed_services.append("Autobrr (incomplete configuration)")
-                else:
-                    result = await sync_mam_id_to_autobrr(host, port, api_key, mam_id)
-                    if result.get("success"):
-                        updated_services.append("Autobrr")
-                    else:
-                        failed_services.append(
-                            f"Autobrr ({result.get('error', result.get('message'))})"
-                        )
-            except Exception as e:
-                _logger.error("[Autobrr] Update error for session '%s': %s", label, e)
-                failed_services.append(f"Autobrr ({e!s})")
+        updated_services, failed_services = await _sync_indexers(
+            cfg, mam_id, label, require_auto_update_on_save=False, verbose=False
+        )
 
         # Prepare response
         if updated_services and not failed_services:
@@ -2739,12 +2531,8 @@ async def api_indexer_update(request: Request) -> dict[str, Any]:
 @app.get("/api/server_time")
 def api_server_time() -> dict[str, Any]:
     """Return current server time in local timezone (ISO format)."""
-    from zoneinfo import ZoneInfo  # noqa: PLC0415
-
-    # Get timezone from environment variable or default to UTC
-    tz_name = os.environ.get("TZ", "UTC")
     try:
-        tz = ZoneInfo(tz_name)
+        tz = ZoneInfo(TZ)
     except Exception:
         tz = ZoneInfo("UTC")
 
@@ -2759,41 +2547,28 @@ def api_version() -> dict[str, str]:
     The version is set via the APP_VERSION environment variable which is
     injected during the Docker build. Defaults to 'dev' for local builds.
     """
-    version = os.environ.get("APP_VERSION", "dev")
-    return {"version": version}
+    return {"version": APP_VERSION}
+
+
+def _serve_favicon(filename: str, media_type: str) -> FileResponse:
+    """Serve a favicon from FRONTEND_PUBLIC_DIR, falling back to the repo's frontend/public."""
+    for directory in (FRONTEND_PUBLIC_DIR, FRONTEND_DIR / "public"):
+        path = directory / filename
+        if path.exists():
+            return FileResponse(str(path), media_type=media_type)
+    raise HTTPException(status_code=404, detail=f"{filename} not found")
 
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon_ico() -> FileResponse:
-    """Serve the glyphicon favicon.ico from the frontend public directory.
-
-    Returns a FileResponse when the file exists, otherwise raises 404.
-    """
-    # Try Docker-friendly public dir first, then local repo frontend/public
-    candidates = [
-        Path(FRONTEND_PUBLIC_DIR) / "favicon.ico",
-        Path(BASE_DIR) / "../frontend/public/favicon.ico",
-    ]
-    for path in candidates:
-        if path.exists():
-            return FileResponse(str(path), media_type="image/x-icon")
-    raise HTTPException(status_code=404, detail="favicon.ico not found")
+    """Serve the glyphicon favicon.ico from the frontend public directory."""
+    return _serve_favicon("favicon.ico", "image/x-icon")
 
 
 @app.get("/favicon.svg", include_in_schema=False)
 def favicon_svg() -> FileResponse:
-    """Serve the favicon.svg from the frontend public directory.
-
-    Returns a FileResponse when the file exists, otherwise raises 404.
-    """
-    candidates = [
-        Path(FRONTEND_PUBLIC_DIR) / "favicon.svg",
-        Path(BASE_DIR) / "../frontend/public/favicon.svg",
-    ]
-    for path in candidates:
-        if path.exists():
-            return FileResponse(str(path), media_type="image/svg+xml")
-    raise HTTPException(status_code=404, detail="favicon.svg not found")
+    """Serve the favicon.svg from the frontend public directory."""
+    return _serve_favicon("favicon.svg", "image/svg+xml")
 
 
 @app.get("/", include_in_schema=False)
@@ -2802,7 +2577,7 @@ def serve_react_index() -> FileResponse:
 
     This endpoint is used by the frontend catch-all route.
     """
-    index_path = Path(FRONTEND_BUILD_DIR) / "index.html"
+    index_path = FRONTEND_BUILD_DIR / "index.html"
     if index_path.exists():
         return FileResponse(str(index_path))
     raise HTTPException(status_code=404, detail="Frontend index.html not found")
@@ -2814,7 +2589,7 @@ def serve_react_app(full_path: str) -> FileResponse:
 
     If the build index.html exists, it is returned. Otherwise a 404 is raised.
     """
-    index_path = Path(FRONTEND_BUILD_DIR) / "index.html"
+    index_path = FRONTEND_BUILD_DIR / "index.html"
     if index_path.exists():
         return FileResponse(str(index_path))
     raise HTTPException(status_code=404, detail="Not Found")
@@ -2829,12 +2604,6 @@ async def session_check_job(label: str) -> None:
     """
     try:
         trigger_source = "scheduled"
-
-        frame = inspect.currentframe()
-        if frame is not None:
-            args, _, _, values = inspect.getargvalues(frame)
-            if "trigger_source" in values:
-                trigger_source = values["trigger_source"]
         _logger.info("[SessionCheck] label=%s source=%s", label, trigger_source)
         cfg = load_session(label)
         mam_id = cfg.get("mam", {}).get("mam_id", "")
@@ -2868,8 +2637,7 @@ async def session_check_job(label: str) -> None:
                 )
                 else None,
             )
-            match = re.search(r"(AS)?(\d+)", asn_full or "")
-            asn = match.group(2) if match else asn_full
+            asn = parse_asn(asn_full)
         else:
             asn = None
         now = datetime.now(UTC)
@@ -2877,14 +2645,13 @@ async def session_check_job(label: str) -> None:
             proxy_cfg = resolve_proxy_from_session_cfg(cfg)
             # Capture old IP/ASN before update
             prev_ip = cfg.get("last_seedbox_ip")
-            prev_asn = cfg.get("last_seedbox_asn")
+            prev_asn = parse_asn(cfg.get("last_seedbox_asn"))
             # Determine new IP/ASN (reuse detected data - optimization)
             proxied_ip = cfg.get("proxied_public_ip")
             mam_ip_override = cfg.get("mam_ip", "").strip()
             new_ip = proxied_ip or detected_public_ip  # Reuse data from earlier
             asn_full, _ = await get_asn_and_timezone_from_ip(new_ip) if new_ip else (None, None)
-            match = re.search(r"(AS)?(\d+)", asn_full or "") if asn_full else None
-            new_asn = match.group(2) if match else asn_full
+            new_asn = parse_asn(asn_full)
             status = await get_status(mam_id=mam_id, proxy_cfg=proxy_cfg)
             _refreshed_mam_id = status.pop("updated_mam_id", None)
             if _refreshed_mam_id and _refreshed_mam_id != mam_id:

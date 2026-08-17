@@ -13,9 +13,7 @@ from functools import cache
 import sqlite3
 from threading import Lock
 
-from backend.config import CONFIG_DIR
-
-DB_PATH = CONFIG_DIR / "mousetrap.db"
+from backend.paths import DB_PATH
 
 _lock = Lock()
 

@@ -20,8 +20,31 @@ from backend.port_monitor import port_monitor_manager
 
 _logger: logging.Logger = logging.getLogger(__name__)
 _CONTAINER_WARN_INTERVAL = 60
-_last_container_warn = 0.0
+_last_container_warn = {"ts": 0.0}
 router = APIRouter()
+
+
+def _stack_event(
+    *,
+    event: str,
+    event_type: str,
+    name: str,
+    status_message: str,
+    message: str,
+    details: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a UI event-log payload for a port-monitor stack lifecycle action."""
+    return {
+        "event": event,
+        "event_type": event_type,
+        "label": name,
+        "stack": name,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "status_message": status_message,
+        "details": details,
+        "message": message,
+        "level": "info",
+    }
 
 
 # List Docker containers endpoint
@@ -33,13 +56,12 @@ def list_containers() -> list[str]:
         # Docker client unavailable (SDK missing or unable to connect)
         # Return an empty list for graceful degradation in environments
         # where Docker is not present (e.g., dev without docker socket).
-        global _last_container_warn  # noqa: PLW0603
         now = time.monotonic()
-        if now - _last_container_warn >= _CONTAINER_WARN_INTERVAL:
+        if now - _last_container_warn["ts"] >= _CONTAINER_WARN_INTERVAL:
             _logger.warning(
                 "[PortMonitorAPI] Docker client not available when listing containers; returning empty list"
             )
-            _last_container_warn = now
+            _last_container_warn["ts"] = now
         return []
     try:
         containers = client.containers.list()
@@ -79,18 +101,19 @@ def update_stack(
     if not stack:
         raise HTTPException(status_code=404, detail="Stack not found")
     # Only log if something actually changed
-    changed = (
-        stack.primary_container != req.primary_container
-        or stack.primary_port != req.primary_port
-        or stack.secondary_containers != req.secondary_containers
-        or stack.interval != req.interval
-    )
     old_values = {
         "primary_container": stack.primary_container,
         "primary_port": stack.primary_port,
         "secondary_containers": stack.secondary_containers,
         "interval": stack.interval,
     }
+    new_values = {
+        "primary_container": req.primary_container,
+        "primary_port": req.primary_port,
+        "secondary_containers": req.secondary_containers,
+        "interval": req.interval,
+    }
+    changed = old_values != new_values
     stack.primary_container = req.primary_container
     stack.primary_port = req.primary_port
     stack.secondary_containers = req.secondary_containers
@@ -101,25 +124,14 @@ def update_stack(
     port_monitor_manager.recheck_stack(name)
     if changed:
         append_ui_event_log(
-            {
-                "event": "port_monitor_edit",
-                "event_type": "port_monitor_edit",
-                "label": name,
-                "stack": name,
-                "timestamp": datetime.now(UTC).isoformat(),
-                "status_message": f"Stack '{name}' edited: primary={req.primary_container}:{req.primary_port}, secondaries={req.secondary_containers}, interval={req.interval} minutes.",
-                "details": {
-                    "old": old_values,
-                    "new": {
-                        "primary_container": req.primary_container,
-                        "primary_port": req.primary_port,
-                        "secondary_containers": req.secondary_containers,
-                        "interval": req.interval,
-                    },
-                },
-                "message": f"Stack '{name}' edited",
-                "level": "info",
-            }
+            _stack_event(
+                event="port_monitor_edit",
+                event_type="port_monitor_edit",
+                name=name,
+                status_message=f"Stack '{name}' edited: primary={req.primary_container}:{req.primary_port}, secondaries={req.secondary_containers}, interval={req.interval} minutes.",
+                message=f"Stack '{name}' edited",
+                details={"old": old_values, "new": new_values},
+            )
         )
     return {"success": True}
 
@@ -154,9 +166,6 @@ class AddPortMonitorStackRequest(BaseModel):
     public_ip: str | None = None
 
 
-# Add update model and endpoint after router definition
-
-
 @router.get("/stacks", response_model=list[PortMonitorStackModel])
 def list_stacks() -> list[PortMonitorStackModel]:
     """Return the configured port monitor stacks in the API response model."""
@@ -167,12 +176,12 @@ def list_stacks() -> list[PortMonitorStackModel]:
             primary_container=s.primary_container,
             primary_port=s.primary_port,
             secondary_containers=s.secondary_containers,
-            interval=getattr(s, "interval", 60),
+            interval=s.interval,
             status=s.status,
             last_checked=s.last_checked,
             last_result=s.last_result,
-            public_ip=getattr(s, "public_ip", None),
-            public_ip_detected=getattr(s, "public_ip_detected", None),
+            public_ip=s.public_ip,
+            public_ip_detected=s.public_ip_detected,
         )
         for s in port_monitor_manager.list_stacks()
     ]
@@ -192,22 +201,19 @@ def add_stack(req: AddPortMonitorStackRequest) -> dict[str, Any]:
     )
 
     append_ui_event_log(
-        {
-            "event": "port_monitor_created",
-            "event_type": "port_monitor_create",
-            "label": req.name,
-            "stack": req.name,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "status_message": f"Stack '{req.name}' created: primary={req.primary_container}:{req.primary_port}, secondaries={req.secondary_containers}, interval={req.interval} minutes.",
-            "details": {
+        _stack_event(
+            event="port_monitor_created",
+            event_type="port_monitor_create",
+            name=req.name,
+            status_message=f"Stack '{req.name}' created: primary={req.primary_container}:{req.primary_port}, secondaries={req.secondary_containers}, interval={req.interval} minutes.",
+            message=f"Stack '{req.name}' created.",
+            details={
                 "primary_container": req.primary_container,
                 "primary_port": req.primary_port,
                 "secondary_containers": req.secondary_containers,
                 "interval": req.interval,
             },
-            "message": f"Stack '{req.name}' created.",
-            "level": "info",
-        }
+        )
     )
     return {"success": True}
 
@@ -232,17 +238,14 @@ def delete_stack(name: str = Query(..., description="Stack name")) -> dict[str, 
 
     port_monitor_manager.remove_stack(name)
     append_ui_event_log(
-        {
-            "event": "port_monitor_deleted",
-            "event_type": "port_monitor_delete",
-            "label": name,
-            "stack": name,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "status_message": f"Stack '{name}' deleted.",
-            "details": {},
-            "message": f"Stack '{name}' deleted.",
-            "level": "info",
-        }
+        _stack_event(
+            event="port_monitor_deleted",
+            event_type="port_monitor_delete",
+            name=name,
+            status_message=f"Stack '{name}' deleted.",
+            message=f"Stack '{name}' deleted.",
+            details={},
+        )
     )
     return {"success": True}
 

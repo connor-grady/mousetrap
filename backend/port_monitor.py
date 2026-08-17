@@ -6,73 +6,105 @@ This module manages stack-based port checks and coordinated restarts.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import logging
-import os
-from pathlib import Path
 import socket
 import threading
 import time
 from typing import Any
 
+import docker
 import yaml
 
-from backend.config import CONFIG_DIR
+from backend.env import DOCKER_HOST
 from backend.event_log import append_ui_event_log
 from backend.notifications_backend import notify_event
-
-try:
-    import docker
-except ImportError:
-    docker = None  # type: ignore[assignment]
+from backend.paths import PORT_MONITOR_PATH
 
 _logger: logging.Logger = logging.getLogger(__name__)
-PORT_MONITOR_CONFIG_PATH = Path(
-    os.environ.get("PORT_MONITOR_CONFIG_PATH") or CONFIG_DIR / "port_monitoring_stacks.yaml"
-)
+
+# Marker substrings that indicate a container IP probe returned no usable address.
+_INVALID_IP_MARKERS = ("not found", "OCI runtime exec", "command not found")
 
 
+def _is_invalid_container_ip(ip: str) -> bool:
+    """True if a container IP probe returned no usable address (empty or an error string)."""
+    return not ip or any(marker in ip for marker in _INVALID_IP_MARKERS)
+
+
+def _stack_event(
+    stack: PortMonitorStack,
+    *,
+    event: str,
+    status: str,
+    status_message: str,
+    level: str,
+    details: dict[str, Any],
+    timestamp: str | None = None,
+) -> dict[str, Any]:
+    """Build a UI event-log payload for a port-monitor stack runtime event.
+
+    ``event`` doubles as ``event_type``; ``label`` and ``stack`` both carry the
+    stack name. ``timestamp`` defaults to the current time.
+    """
+    return {
+        "event": event,
+        "event_type": event,
+        "label": stack.name,
+        "stack": stack.name,
+        "primary_container": stack.primary_container,
+        "primary_port": stack.primary_port,
+        "timestamp": timestamp or datetime.now(tz=UTC).isoformat(),
+        "status": status,
+        "status_message": status_message,
+        "details": details,
+        "level": level,
+    }
+
+
+@dataclass(eq=False)
 class PortMonitorStack:
-    """Represents a monitored port "stack".
+    """A monitored port "stack": a primary container/port plus optional secondaries.
 
-    A stack defines a primary container/port pair and optional secondary
-    containers that should be restarted if the primary's public port is
-    unreachable. This object holds runtime state used by the manager.
+    Secondary containers are restarted if the primary's public port is
+    unreachable. Instances also carry runtime state used by the manager.
+
+    Attributes:
+        name: Human-readable stack name.
+        primary_container: Name of the primary docker container to monitor.
+        primary_port: Public port on the primary container to check.
+        secondary_containers: Secondary container names to restart if the primary fails.
+        interval: Check interval in minutes.
+        public_ip: Optional manual public IP override for the primary container.
+        public_ip_detected: Whether the public IP was detected automatically.
     """
 
-    def __init__(
-        self,
-        name: str,
-        primary_container: str,
-        primary_port: int,
-        secondary_containers: list[str],
-        interval: int = 60,
-        public_ip: str | None = None,
-        public_ip_detected: bool | None = None,
-    ):
-        """Initialize a PortMonitorStack.
+    name: str
+    primary_container: str
+    primary_port: int
+    secondary_containers: list[str]
+    interval: int = 60
+    public_ip: str | None = None
+    public_ip_detected: bool | None = None
+    status: str = field(default="Unknown", init=False)
+    last_checked: float = field(default=0.0, init=False)
+    last_result: bool = field(default=False, init=False)
+    # Track failures for manual IP and pause restarts once the threshold is reached
+    consecutive_manual_ip_failures: int = field(default=0, init=False)
+    manual_ip_paused: bool = field(default=False, init=False)
 
-        Args:
-            name: Human-readable stack name.
-            primary_container: Name of the primary docker container to monitor.
-            primary_port: Public port on the primary container to check.
-            secondary_containers: List of secondary container names to restart if primary fails.
-            interval: Check interval in minutes (default: 60).
-            public_ip: Optional manual public IP override for the primary container.
-            public_ip_detected: Optional flag indicating whether the public IP was detected automatically.
-        """
-        self.name = name
-        self.primary_container = primary_container
-        self.primary_port = primary_port
-        self.secondary_containers = secondary_containers
-        self.interval = interval
-        self.status = "Unknown"
-        self.last_checked = 0.0
-        self.last_result = False
-        self.public_ip = public_ip
-        self.public_ip_detected = public_ip_detected
-        self.consecutive_manual_ip_failures = 0  # Track failures for manual IP
-        self.manual_ip_paused = False  # Pause restarts if threshold reached
+    def to_config_dict(self) -> dict[str, Any]:
+        """Return the persisted-config representation (the constructor fields)."""
+        return {
+            "name": self.name,
+            "primary_container": self.primary_container,
+            "primary_port": self.primary_port,
+            "secondary_containers": self.secondary_containers,
+            "interval": self.interval,
+            "public_ip": self.public_ip,
+            "public_ip_detected": self.public_ip_detected,
+        }
 
 
 class PortMonitorStackManager:
@@ -92,12 +124,7 @@ class PortMonitorStackManager:
     """
 
     def __init__(self) -> None:
-        """Initialize the PortMonitorStackManager and load configured stacks.
-
-        The manager holds a list of PortMonitorStack objects and manages
-        background monitoring state, docker client caching, and rate limiting
-        for warnings.
-        """
+        """Initialize the PortMonitorStackManager and load configured stacks."""
         self.stacks: list[PortMonitorStack] = []
         self.running: bool = False
         self.thread: threading.Thread | None = None
@@ -107,12 +134,10 @@ class PortMonitorStackManager:
 
     def _should_log_warning(self, key: str, min_interval: int = 30) -> bool:
         """Rate limit warnings to prevent log spam."""
-        current_time = time.time()
-        if key not in self._last_warning_times:
-            self._last_warning_times[key] = current_time
-            return True
-        if current_time - self._last_warning_times[key] >= min_interval:
-            self._last_warning_times[key] = current_time
+        now = time.time()
+        last = self._last_warning_times.get(key)
+        if last is None or now - last >= min_interval:
+            self._last_warning_times[key] = now
             return True
         return False
 
@@ -123,12 +148,12 @@ class PortMonitorStackManager:
         parse or IO errors are caught and logged; in that case the stacks
         list will be empty.
         """
-        if not Path(PORT_MONITOR_CONFIG_PATH).exists():
+        if not PORT_MONITOR_PATH.exists():
             self.stacks = []
-            _logger.info("[PortMonitor] No config found at %s", PORT_MONITOR_CONFIG_PATH)
+            _logger.info("[PortMonitor] No config found at %s", PORT_MONITOR_PATH)
             return
         try:
-            with PORT_MONITOR_CONFIG_PATH.open(encoding="utf-8") as f:
+            with PORT_MONITOR_PATH.open(encoding="utf-8") as f:
                 data = yaml.safe_load(f) or []
             seen = set()
             unique_stacks = []
@@ -149,7 +174,7 @@ class PortMonitorStackManager:
                         d.get("secondary_containers", []),
                         d.get("interval", 60),
                         d.get("public_ip"),
-                        d.get("public_ip_detected", None),
+                        d.get("public_ip_detected"),
                     )
                 )
             self.stacks = unique_stacks
@@ -164,22 +189,8 @@ class PortMonitorStackManager:
         Errors during writing are logged but not raised to the caller.
         """
         try:
-            with PORT_MONITOR_CONFIG_PATH.open("w", encoding="utf-8") as f:
-                yaml.safe_dump(
-                    [
-                        {
-                            "name": s.name,
-                            "primary_container": s.primary_container,
-                            "primary_port": s.primary_port,
-                            "secondary_containers": s.secondary_containers,
-                            "interval": getattr(s, "interval", 60),
-                            "public_ip": getattr(s, "public_ip", None),
-                            "public_ip_detected": getattr(s, "public_ip_detected", None),
-                        }
-                        for s in self.stacks
-                    ],
-                    f,
-                )
+            with PORT_MONITOR_PATH.open("w", encoding="utf-8") as f:
+                yaml.safe_dump([s.to_config_dict() for s in self.stacks], f)
         except Exception as e:
             _logger.error("[PortMonitorStack] Failed to save stacks: %s", e)
 
@@ -190,43 +201,26 @@ class PortMonitorStackManager:
         When DOCKER_HOST is set (e.g., tcp://docker-proxy:2375), connects via HTTP.
         Otherwise, uses the default docker socket at /var/run/docker.sock.
 
-        Returns None if the docker SDK is unavailable or client creation
-        fails. Returns docker.DockerClient when available.
+        Returns None if client creation fails, otherwise a docker.DockerClient.
         """
         if self._docker_client is not None:
             return self._docker_client
-        # If the docker python SDK failed to import, warn once and return None
-        if not docker:
-            warning_key = "docker_module_missing"
-            if self._should_log_warning(warning_key, min_interval=60):
-                _logger.warning(
-                    "[PortMonitorStack] Docker python SDK not installed; docker-related features will be unavailable."
-                )
-            return None
         try:
-            # Check for Docker Socket Proxy URL from environment variable
-            docker_host = os.environ.get("DOCKER_HOST")
-
-            if docker_host:
+            if DOCKER_HOST:
                 # Connect via socket proxy (e.g., tcp://docker-proxy:2375)
                 _logger.info(
-                    "[PortMonitorStack] Connecting to Docker via DOCKER_HOST: %s",
-                    docker_host,
+                    "[PortMonitorStack] Connecting to Docker via DOCKER_HOST: %s", DOCKER_HOST
                 )
-                client = docker.DockerClient(base_url=docker_host)
+                client = docker.DockerClient(base_url=DOCKER_HOST)
             else:
                 # Use default socket at /var/run/docker.sock
                 client = docker.from_env()
-
             self._docker_client = client
         except Exception as e:
-            # Log the error creating the docker client (rate limited)
-            warning_key = "docker_from_env_failed"
-            if self._should_log_warning(warning_key, min_interval=60):
-                docker_host = os.environ.get("DOCKER_HOST", "/var/run/docker.sock")
+            if self._should_log_warning("docker_from_env_failed", min_interval=60):
                 _logger.error(
                     "[PortMonitorStack] Failed to create docker client (DOCKER_HOST=%s): %s",
-                    docker_host,
+                    DOCKER_HOST or "/var/run/docker.sock",
                     e,
                 )
             return None
@@ -240,9 +234,7 @@ class PortMonitorStackManager:
         """
         # Find the stack object to check for manual public_ip override
         stack = next((s for s in self.stacks if s.primary_container == container_name), None)
-        ip = None
-        public_ip_detected = False
-        if stack and getattr(stack, "public_ip", None):
+        if stack and stack.public_ip:
             ip = stack.public_ip
             _logger.info(
                 "[PortMonitorStack] Using manual public_ip override for %s: %s",
@@ -253,8 +245,7 @@ class PortMonitorStackManager:
         else:
             client = self.get_docker_client()
             if not client:
-                warning_key = f"docker_client_{container_name}"
-                if self._should_log_warning(warning_key, min_interval=60):
+                if self._should_log_warning(f"docker_client_{container_name}", min_interval=60):
                     _logger.warning(
                         "[PortMonitorStack] Docker client not available for container %s",
                         container_name,
@@ -267,32 +258,15 @@ class PortMonitorStackManager:
                 # Try curl first
                 exec_result = container.exec_run("curl -s https://ipinfo.io/ip")
                 ip = exec_result.output.decode().strip()
-                if (
-                    not ip
-                    or "not found" in ip
-                    or "OCI runtime exec" in ip
-                    or "command not found" in ip
-                ):
+                if _is_invalid_container_ip(ip):
                     # Try wget as fallback
                     exec_result = container.exec_run("wget -qO- https://ipinfo.io/ip")
                     ip = exec_result.output.decode().strip()
-
-                _logger.debug(
-                    "[PortMonitorStack] Fetched public IP for %s: %s",
-                    container_name,
-                    ip,
-                )  # Changed to DEBUG
-                if (
-                    not ip
-                    or "not found" in ip
-                    or "OCI runtime exec" in ip
-                    or "command not found" in ip
-                ):
-                    warning_key = f"no_ip_{container_name}"
-                    if self._should_log_warning(warning_key, min_interval=60):
+                _logger.debug("[PortMonitorStack] Fetched public IP for %s: %s", container_name, ip)
+                if _is_invalid_container_ip(ip):
+                    if self._should_log_warning(f"no_ip_{container_name}", min_interval=60):
                         _logger.warning(
-                            "[PortMonitorStack] No valid public IP found for %s",
-                            container_name,
+                            "[PortMonitorStack] No valid public IP found for %s", container_name
                         )
                     if stack:
                         stack.public_ip_detected = False
@@ -300,9 +274,7 @@ class PortMonitorStackManager:
                 public_ip_detected = True
             except Exception as e:
                 _logger.error(
-                    "[PortMonitorStack] Error fetching public IP for %s: %s",
-                    container_name,
-                    e,
+                    "[PortMonitorStack] Error fetching public IP for %s: %s", container_name, e
                 )
                 if stack:
                     stack.public_ip_detected = False
@@ -315,13 +287,12 @@ class PortMonitorStackManager:
                     port,
                     ip,
                     container_name,
-                )  # Changed to DEBUG
+                )
                 if stack:
                     stack.public_ip_detected = public_ip_detected
                 return True
         except Exception as e:
-            warning_key = f"port_check_{container_name}_{port}_{ip}"
-            if self._should_log_warning(warning_key, min_interval=30):
+            if self._should_log_warning(f"port_check_{container_name}_{port}_{ip}", min_interval=30):
                 _logger.warning(
                     "[PortMonitorStack] Port %s on %s (container %s) is NOT reachable from host: %s",
                     port,
@@ -343,12 +314,29 @@ class PortMonitorStackManager:
         if not client:
             return False
         try:
-            container = client.containers.get(container_name)
-            container.restart()
+            client.containers.get(container_name).restart()
         except Exception:
             return False
         else:
             return True
+
+    def _is_container_running(self, container_name: str) -> bool:
+        """Return True if the named container reports a 'running' status."""
+        client = self.get_docker_client()
+        if not client:
+            return False
+        try:
+            return client.containers.get(container_name).status == "running"
+        except Exception:
+            return False
+
+    def _check_and_record(self, stack: PortMonitorStack) -> bool:
+        """Check the stack's primary port, record the result on the stack, and return it."""
+        result = self.check_port(stack.primary_container, stack.primary_port)
+        stack.last_checked = time.time()
+        stack.last_result = result
+        stack.status = "OK" if result else "Failed"
+        return result
 
     async def restart_stack(self, stack: PortMonitorStack) -> None:
         """Restart the primary and secondary containers for a stack.
@@ -357,34 +345,24 @@ class PortMonitorStackManager:
         log, restarts the primary container and, if appropriate, restarts
         the secondary containers and rechecks the stack status.
         """
-        # Set status to 'Restarting...'
         stack.status = "Restarting..."
         self.save_stacks()
-
-        # Log restart event
         append_ui_event_log(
-            {
-                "event": "port_monitor_restart",
-                "event_type": "port_monitor_restart",
-                "label": stack.name,
-                "stack": stack.name,
-                "primary_container": stack.primary_container,
-                "primary_port": stack.primary_port,
-                "timestamp": datetime.now(tz=UTC).isoformat(),
-                "status": "Restarting...",
-                "status_message": f"Restarting stack '{stack.name}' (primary: {stack.primary_container}:{stack.primary_port})...",
-                "details": {
+            _stack_event(
+                stack,
+                event="port_monitor_restart",
+                status="Restarting...",
+                status_message=f"Restarting stack '{stack.name}' (primary: {stack.primary_container}:{stack.primary_port})...",
+                level="warning",
+                details={
                     "primary_container": stack.primary_container,
                     "primary_port": stack.primary_port,
                     "secondaries": stack.secondary_containers,
                 },
-                "level": "warning",
-            }
+            )
         )
-
         # Restart primary
         self.restart_container(stack.primary_container)
-
         # Wait for primary to be reachable (up to 60s), fallback to running status
         port_ok = False
         for _ in range(12):  # Wait up to 12*5=60s
@@ -392,34 +370,18 @@ class PortMonitorStackManager:
                 port_ok = True
                 break
             await asyncio.sleep(5)
-
         if not port_ok:
-            # Check if container is running
-            client = self.get_docker_client()
-            running = False
-            if client:
-                try:
-                    container = client.containers.get(stack.primary_container)
-                    running = container.status == "running"
-                except Exception:
-                    running = False
-
-            if running:
-                # Notify user: port unreachable, but container running, proceeding
+            if self._is_container_running(stack.primary_container):
+                # Port unreachable, but container running, proceeding
                 append_ui_event_log(
-                    {
-                        "event": "port_monitor_port_timeout",
-                        "event_type": "port_monitor_port_timeout",
-                        "label": stack.name,
-                        "stack": stack.name,
-                        "primary_container": stack.primary_container,
-                        "primary_port": stack.primary_port,
-                        "timestamp": datetime.now(tz=UTC).isoformat(),
-                        "status": "Port unreachable, container running",
-                        "status_message": f"Port {stack.primary_port} on {stack.primary_container} not reachable after 60s, but container is running. Proceeding to restart secondaries.",
-                        "details": {},
-                        "level": "warning",
-                    }
+                    _stack_event(
+                        stack,
+                        event="port_monitor_port_timeout",
+                        status="Port unreachable, container running",
+                        status_message=f"Port {stack.primary_port} on {stack.primary_container} not reachable after 60s, but container is running. Proceeding to restart secondaries.",
+                        level="warning",
+                        details={},
+                    )
                 )
                 await notify_event(
                     event_type="port_monitor_failure",
@@ -429,21 +391,16 @@ class PortMonitorStackManager:
                     details={},
                 )
             else:
-                # Notify user: container not running
+                # Container not running
                 append_ui_event_log(
-                    {
-                        "event": "port_monitor_container_not_running",
-                        "event_type": "port_monitor_container_not_running",
-                        "label": stack.name,
-                        "stack": stack.name,
-                        "primary_container": stack.primary_container,
-                        "primary_port": stack.primary_port,
-                        "timestamp": datetime.now(tz=UTC).isoformat(),
-                        "status": "Container not running",
-                        "status_message": f"Container {stack.primary_container} is not running after restart. Secondary containers not restarted.",
-                        "details": {},
-                        "level": "error",
-                    }
+                    _stack_event(
+                        stack,
+                        event="port_monitor_container_not_running",
+                        status="Container not running",
+                        status_message=f"Container {stack.primary_container} is not running after restart. Secondary containers not restarted.",
+                        level="error",
+                        details={},
+                    )
                 )
                 await notify_event(
                     event_type="port_monitor_failure",
@@ -453,11 +410,9 @@ class PortMonitorStackManager:
                     details={},
                 )
                 return  # Do not restart secondaries
-
         # Restart all secondaries
         for sec in stack.secondary_containers:
             self.restart_container(sec)
-
         # Immediately recheck status after restart (this will update status and log result)
         self.recheck_stack(stack.name)
 
@@ -475,7 +430,6 @@ class PortMonitorStackManager:
         If a stack with the same name already exists the operation is
         ignored.
         """
-        # Prevent duplicate stack names
         if any(s.name == name for s in self.stacks):
             _logger.warning(
                 "[PortMonitorStack] Attempted to add duplicate stack '%s', ignoring.", name
@@ -484,14 +438,9 @@ class PortMonitorStackManager:
         stack = PortMonitorStack(
             name, primary_container, primary_port, secondary_containers, interval, public_ip
         )
-        # Immediately check status on creation
-        result = self.check_port(primary_container, primary_port)
-        stack.last_checked = time.time()
-        stack.last_result = result
-        stack.status = "OK" if result else "Failed"
+        result = self._check_and_record(stack)
         self.stacks.append(stack)
         self.save_stacks()
-
         _logger.info(
             "[PortMonitorStack] Added stack '%s' with initial status: %s",
             name,
@@ -506,10 +455,7 @@ class PortMonitorStackManager:
         stack = self.get_stack(name)
         if not stack:
             return False
-        result = self.check_port(stack.primary_container, stack.primary_port)
-        stack.last_checked = time.time()
-        stack.last_result = result
-        stack.status = "OK" if result else "Failed"
+        self._check_and_record(stack)
         self.save_stacks()
         return True
 
@@ -520,10 +466,7 @@ class PortMonitorStackManager:
 
     def get_stack(self, name: str) -> PortMonitorStack | None:
         """Return the stack with the given name or None if not found."""
-        for s in self.stacks:
-            if s.name == name:
-                return s
-        return None
+        return next((s for s in self.stacks if s.name == name), None)
 
     def list_stacks(self) -> list[PortMonitorStack]:
         """Return the list of configured PortMonitorStack objects."""
@@ -540,10 +483,7 @@ class PortMonitorStackManager:
         # Perform initial status checks immediately at startup
         _logger.info("[PortMonitorStack] Starting port monitoring with immediate initial checks...")
         for stack in self.stacks:
-            result = self.check_port(stack.primary_container, stack.primary_port)
-            stack.last_checked = time.time()
-            stack.last_result = result
-            stack.status = "OK" if result else "Failed"
+            result = self._check_and_record(stack)
             _logger.info(
                 "[PortMonitorStack] Initial check for %s:%s (stack '%s'): %s",
                 stack.primary_container,
@@ -559,99 +499,79 @@ class PortMonitorStackManager:
         while self.running:
             now = time.time()
             for stack in self.stacks:
-                # Only check if enough time has passed since last check
-                interval_min = getattr(stack, "interval", 60)  # interval in minutes
-                interval_sec = interval_min * 60
-                if not stack.last_checked or (now - stack.last_checked) >= interval_sec:
-                    # Manual IP failure tracking logic
-                    manual_ip = getattr(stack, "public_ip", None)
-                    result = self.check_port(stack.primary_container, stack.primary_port)
-                    stack.last_checked = time.time()
-                    stack.last_result = result
-                    stack.status = "OK" if result else "Failed"
-                    _logger.info(
-                        "[PortMonitorStack] Port check for %s:%s (stack '%s'): %s",
-                        stack.primary_container,
-                        stack.primary_port,
-                        stack.name,
-                        "OK" if result else "FAILED",
-                    )
-
-                    ts = stack.last_checked
-                    if not ts:
-                        ts = time.time()
-                    append_ui_event_log(
-                        {
-                            "event": "port_monitor_check",
-                            "event_type": "port_monitor_check",
-                            "label": stack.name,
-                            "stack": stack.name,
+                # Only check once enough time has passed since the last check
+                if stack.last_checked and (now - stack.last_checked) < stack.interval * 60:
+                    continue
+                manual_ip = stack.public_ip
+                result = self._check_and_record(stack)
+                _logger.info(
+                    "[PortMonitorStack] Port check for %s:%s (stack '%s'): %s",
+                    stack.primary_container,
+                    stack.primary_port,
+                    stack.name,
+                    "OK" if result else "FAILED",
+                )
+                append_ui_event_log(
+                    _stack_event(
+                        stack,
+                        event="port_monitor_check",
+                        status="OK" if result else "Failed",
+                        status_message=f"Port check for {stack.primary_container}:{stack.primary_port} (stack '{stack.name}'): {'OK' if result else 'FAILED'}",
+                        level="primary" if result else "warning",
+                        details={
                             "primary_container": stack.primary_container,
                             "primary_port": stack.primary_port,
-                            "status": "OK" if result else "Failed",
-                            "timestamp": datetime.fromtimestamp(ts, tz=UTC).isoformat(),
-                            "status_message": f"Port check for {stack.primary_container}:{stack.primary_port} (stack '{stack.name}'): {'OK' if result else 'FAILED'}",
-                            "details": {
-                                "primary_container": stack.primary_container,
-                                "primary_port": stack.primary_port,
-                                "result": result,
-                                "interval": getattr(stack, "interval", 60),
-                                "secondaries": stack.secondary_containers,
-                            },
-                            "level": "primary" if result else "warning",
-                        }
+                            "result": result,
+                            "interval": stack.interval,
+                            "secondaries": stack.secondary_containers,
+                        },
+                        timestamp=datetime.fromtimestamp(stack.last_checked, tz=UTC).isoformat(),
                     )
-                    if manual_ip:
-                        if not result:
-                            stack.consecutive_manual_ip_failures = (
-                                getattr(stack, "consecutive_manual_ip_failures", 0) + 1
-                            )
-                            if stack.consecutive_manual_ip_failures >= 3:
-                                stack.manual_ip_paused = True
-                                append_ui_event_log(
-                                    {
-                                        "event": "port_monitor_manual_ip_paused",
-                                        "event_type": "port_monitor_manual_ip_paused",
-                                        "label": stack.name,
-                                        "stack": stack.name,
-                                        "primary_container": stack.primary_container,
-                                        "primary_port": stack.primary_port,
-                                        "timestamp": datetime.now(tz=UTC).isoformat(),
-                                        "status": "Manual IP unreachable, auto-restart paused",
-                                        "status_message": f"Manual IP {manual_ip} unreachable for 3+ cycles. Auto-restart paused until user updates or disables manual IP.",
-                                        "details": {},
-                                        "level": "error",
-                                    }
-                                )
-                                await notify_event(
-                                    event_type="port_monitor_failure",
-                                    label=stack.name,
-                                    status="ERROR",
-                                    message=f"Manual IP {manual_ip} unreachable for 3+ cycles. Auto-restart paused until user updates or disables manual IP.",
+                )
+                if manual_ip:
+                    if not result:
+                        stack.consecutive_manual_ip_failures += 1
+                        if stack.consecutive_manual_ip_failures >= 3:
+                            stack.manual_ip_paused = True
+                            append_ui_event_log(
+                                _stack_event(
+                                    stack,
+                                    event="port_monitor_manual_ip_paused",
+                                    status="Manual IP unreachable, auto-restart paused",
+                                    status_message=f"Manual IP {manual_ip} unreachable for 3+ cycles. Auto-restart paused until user updates or disables manual IP.",
+                                    level="error",
                                     details={},
                                 )
-                                self.save_stacks()
-                                continue  # Skip restart
-                        else:
-                            stack.consecutive_manual_ip_failures = 0
-                            stack.manual_ip_paused = False
-                    if not result:
-                        if getattr(stack, "manual_ip_paused", False):
-                            continue  # Don't restart if paused
-                        await notify_event(
-                            event_type="port_monitor_failure",
-                            label=stack.name,
-                            status="FAILED",
-                            message=f"Docker Port Monitor: {stack.primary_container}:{stack.primary_port} unreachable (stack '{stack.name}')",
-                            details={
-                                "primary_container": stack.primary_container,
-                                "primary_port": stack.primary_port,
-                                "stack": stack.name,
-                                "secondaries": stack.secondary_containers,
-                            },
-                        )
-                        await self.restart_stack(stack)
-                    self.save_stacks()
+                            )
+                            await notify_event(
+                                event_type="port_monitor_failure",
+                                label=stack.name,
+                                status="ERROR",
+                                message=f"Manual IP {manual_ip} unreachable for 3+ cycles. Auto-restart paused until user updates or disables manual IP.",
+                                details={},
+                            )
+                            self.save_stacks()
+                            continue  # Skip restart
+                    else:
+                        stack.consecutive_manual_ip_failures = 0
+                        stack.manual_ip_paused = False
+                if not result:
+                    if stack.manual_ip_paused:
+                        continue  # Don't restart if paused
+                    await notify_event(
+                        event_type="port_monitor_failure",
+                        label=stack.name,
+                        status="FAILED",
+                        message=f"Docker Port Monitor: {stack.primary_container}:{stack.primary_port} unreachable (stack '{stack.name}')",
+                        details={
+                            "primary_container": stack.primary_container,
+                            "primary_port": stack.primary_port,
+                            "stack": stack.name,
+                            "secondaries": stack.secondary_containers,
+                        },
+                    )
+                    await self.restart_stack(stack)
+                self.save_stacks()
             await asyncio.sleep(5)
 
     def start(self) -> None:
@@ -661,12 +581,8 @@ class PortMonitorStackManager:
         is not already running.
         """
         self.load_stacks()
-        # Perform initial status checks for all stacks
         for stack in self.stacks:
-            result = self.check_port(stack.primary_container, stack.primary_port)
-            stack.last_checked = time.time()
-            stack.last_result = result
-            stack.status = "OK" if result else "Failed"
+            self._check_and_record(stack)
         self.save_stacks()
         if not self.running:
             self.thread = threading.Thread(

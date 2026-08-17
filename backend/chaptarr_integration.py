@@ -33,17 +33,21 @@ async def test_chaptarr_connection(host: str, port: int, api_key: str) -> dict[s
             aiohttp.ClientSession() as session,
             session.get(url, headers=headers, timeout=_TIMEOUT) as response,
         ):
-            if response.status == 200:
-                indexers = await response.json()
-                return {
-                    "success": True,
-                    "message": f"Connected successfully. Found {len(indexers)} indexer(s).",
-                    "indexer_count": len(indexers),
-                }
-            if response.status == 401:
-                return {"success": False, "message": "Authentication failed. Check API key."}
-
-            return {"success": False, "message": f"Connection failed: HTTP {response.status}"}
+            match response.status:
+                case 200:
+                    indexers = await response.json()
+                    return {
+                        "success": True,
+                        "message": f"Connected successfully. Found {len(indexers)} indexer(s).",
+                        "indexer_count": len(indexers),
+                    }
+                case 401:
+                    return {"success": False, "message": "Authentication failed. Check API key."}
+                case _:
+                    return {
+                        "success": False,
+                        "message": f"Connection failed: HTTP {response.status}",
+                    }
     except TimeoutError:
         return {"success": False, "message": "Connection timeout"}
     except Exception as e:
@@ -133,18 +137,20 @@ async def get_indexer_config(host: str, port: int, api_key: str, indexer_id: int
             aiohttp.ClientSession() as session,
             session.get(url, headers=headers, timeout=_TIMEOUT) as response,
         ):
-            if response.status == 200:
-                config = await response.json()
-                return {"success": True, "config": config, "message": "Success"}
-            if response.status == 404:
-                return {
-                    "success": False,
-                    "message": f"Indexer ID {indexer_id} not found.",
-                }
-            return {
-                "success": False,
-                "message": f"HTTP {response.status}: {response.reason}",
-            }
+            match response.status:
+                case 200:
+                    config = await response.json()
+                    return {"success": True, "config": config, "message": "Success"}
+                case 404:
+                    return {
+                        "success": False,
+                        "message": f"Indexer ID {indexer_id} not found.",
+                    }
+                case _:
+                    return {
+                        "success": False,
+                        "message": f"HTTP {response.status}: {response.reason}",
+                    }
     except Exception as e:
         _logger.exception("Failed to fetch indexer config")
         return {"success": False, "message": f"Error: {e!s}"}

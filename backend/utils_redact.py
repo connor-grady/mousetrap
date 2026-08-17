@@ -28,8 +28,12 @@ def redact_sensitive(data: Any) -> Any:
     Any
         A new data structure with values for sensitive keys replaced by a redaction string.
     """
-    if isinstance(data, dict):
-        return {k: (REDACTED if k in REDACT_KEYS else redact_sensitive(v)) for k, v in data.items()}
-    if isinstance(data, list):
-        return [redact_sensitive(item) for item in data]
-    return data
+    match data:
+        case dict():
+            return {
+                k: REDACTED if k in REDACT_KEYS else redact_sensitive(v) for k, v in data.items()
+            }
+        case list():
+            return [redact_sensitive(item) for item in data]
+        case _:
+            return data

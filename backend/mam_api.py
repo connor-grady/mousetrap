@@ -6,14 +6,17 @@ and resolve public IP/ASN information through optional proxy configurations.
 
 import json
 import logging
-import os
 from typing import Any, Literal
 
 import aiohttp
 
-from backend.utils import build_proxy_dict
+from backend.env import IPINFO_TOKEN
+from backend.utils import build_proxy_dict, redact_proxy_urls
 
 _logger: logging.Logger = logging.getLogger(__name__)
+
+# Default HTTP timeout for all MaM/ipinfo requests.
+_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 MamResponseClass = Literal["ok", "invalid_cookie", "other_error"]
 
@@ -35,29 +38,20 @@ def classify_mam_response(status_code: int, msg: str) -> MamResponseClass:
     return "other_error"
 
 
-async def get_proxied_public_ip(proxy_cfg: dict) -> str | None:
+async def get_proxied_public_ip(proxy_cfg: dict[str, Any]) -> str | None:
     """Returns the public IP as seen through the given proxy config."""
-    proxies = build_proxy_dict(proxy_cfg)
-    if not proxies:
+    if not (proxies := build_proxy_dict(proxy_cfg)):
         return None
+    proxy_url = proxies.get("https") or proxies.get("http")
     try:
-        proxy_url = (
-            proxies.get("https") or proxies.get("http") if isinstance(proxies, dict) else None
-        )
-        try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with (
-                aiohttp.ClientSession(timeout=timeout) as session,
-                session.get("https://api.ipify.org", timeout=timeout, proxy=proxy_url) as resp,
-            ):
-                text = await resp.text()
-                if resp.status == 200:
-                    return text.strip()
-        except Exception as e:
-            _logger.warning("[get_proxied_public_ip] Failed: %s", e)
-            return None
+        async with (
+            aiohttp.ClientSession(timeout=_REQUEST_TIMEOUT) as session,
+            session.get("https://api.ipify.org", timeout=_REQUEST_TIMEOUT, proxy=proxy_url) as resp,
+        ):
+            text = await resp.text()
+            if resp.status == 200:
+                return text.strip()
     except Exception as e:
-        # Defensive: preserve original behavior on unexpected errors
         _logger.warning("[get_proxied_public_ip] Failed: %s", e)
         return None
     return None
@@ -66,16 +60,14 @@ async def get_proxied_public_ip(proxy_cfg: dict) -> str | None:
 async def get_proxied_public_ip_and_asn(proxy_cfg: dict[str, Any]) -> tuple[str | None, str | None]:
     """Returns (public_ip, asn) as seen through the given proxy config, using ipinfo.io and the API token if available."""
     proxies = build_proxy_dict(proxy_cfg)
-    token = os.environ.get("IPINFO_TOKEN")
     url = "https://ipinfo.io/json"
-    if token:
-        url += f"?token={token}"
-    proxy_url = proxies.get("https") or proxies.get("http") if isinstance(proxies, dict) else None
+    if IPINFO_TOKEN:
+        url += f"?token={IPINFO_TOKEN}"
+    proxy_url = proxies.get("https") or proxies.get("http") if proxies else None
     try:
-        timeout = aiohttp.ClientTimeout(total=10)
         async with (
-            aiohttp.ClientSession(timeout=timeout) as session,
-            session.get(url, timeout=timeout, proxy=proxy_url) as resp,
+            aiohttp.ClientSession(timeout=_REQUEST_TIMEOUT) as session,
+            session.get(url, timeout=_REQUEST_TIMEOUT, proxy=proxy_url) as resp,
         ):
             text = await resp.text()
             if resp.status == 200:
@@ -91,6 +83,17 @@ async def get_proxied_public_ip_and_asn(proxy_cfg: dict[str, Any]) -> tuple[str 
         _logger.warning("[get_proxied_public_ip_and_asn] Failed: %s", e)
         return None, None
     return None, None
+
+
+def _status_error(message: str) -> dict[str, Any]:
+    """Build a `get_status` error result carrying the given message."""
+    return {
+        "mam_cookie_exists": False,
+        "points": None,
+        "wedge_active": None,
+        "vip_active": None,
+        "message": message,
+    }
 
 
 async def get_status(mam_id: str, proxy_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -122,13 +125,7 @@ async def get_status(mam_id: str, proxy_cfg: dict[str, Any] | None = None) -> di
 
     """
     if not mam_id:
-        return {
-            "mam_cookie_exists": False,
-            "points": None,
-            "wedge_active": None,
-            "vip_active": None,
-            "message": "No MaM ID provided.",
-        }
+        return _status_error("No MaM ID provided.")
     url = "https://www.myanonamouse.net/jsonLoad.php?snatch_summary"
     cookies = {"mam_id": mam_id}
     proxies = None
@@ -139,21 +136,13 @@ async def get_status(mam_id: str, proxy_cfg: dict[str, Any] | None = None) -> di
     proxy_url_log = None
     if proxies:
         proxy_label = proxy_cfg.get("label") if proxy_cfg else None
-        proxy_url_log = {
-            k: v.replace(proxy_cfg.get("password", ""), "***")
-            if proxy_cfg and proxy_cfg.get("password")
-            else v
-            for k, v in proxies.items()
-        }
+        proxy_url_log = redact_proxy_urls(proxies, proxy_cfg)
         _logger.debug("[get_status] Using proxy label: %s, proxies: %s", proxy_label, proxy_url_log)
     try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        proxy_url = (
-            proxies.get("https") or proxies.get("http") if isinstance(proxies, dict) else None
-        )
+        proxy_url = proxies.get("https") or proxies.get("http") if proxies else None
         async with (
             aiohttp.ClientSession(cookies=cookies) as session,
-            session.get(url, timeout=timeout, proxy=proxy_url) as resp,
+            session.get(url, timeout=_REQUEST_TIMEOUT, proxy=proxy_url) as resp,
         ):
             text = await resp.text()
             # Handle HTTP errors similarly to requests.raise_for_status, but capture the
@@ -185,13 +174,9 @@ async def get_status(mam_id: str, proxy_cfg: dict[str, Any] | None = None) -> di
             try:
                 data = json.loads(text)
             except Exception as json_e:
-                return {
-                    "mam_cookie_exists": False,
-                    "points": None,
-                    "wedge_active": None,
-                    "vip_active": None,
-                    "message": f"MaM API did not return valid JSON: {json_e}. Response: {text[:200]}",
-                }
+                return _status_error(
+                    f"MaM API did not return valid JSON: {json_e}. Response: {text[:200]}"
+                )
         # Parse points, wedge, VIP status from response
         points = data.get("seedbonus")
         wedge_active = data.get("wedge_active")
@@ -203,13 +188,7 @@ async def get_status(mam_id: str, proxy_cfg: dict[str, Any] | None = None) -> di
             vip_active = data.get("vip", False)
 
     except Exception as e:
-        return {
-            "mam_cookie_exists": False,
-            "points": None,
-            "wedge_active": None,
-            "vip_active": None,
-            "message": f"Failed to fetch status: {e}",
-        }
+        return _status_error(f"Failed to fetch status: {e}")
     else:
         # Do not set a default message here; let the main logic in app.py set the status_message
         return {
@@ -259,12 +238,11 @@ async def get_mam_seen_ip_info(mam_id: str, proxy_cfg: dict[str, Any]) -> dict[s
     url = "https://t.myanonamouse.net/json/jsonIp.php"
     cookies = {"mam_id": mam_id}
     proxies = build_proxy_dict(proxy_cfg)
-    timeout = aiohttp.ClientTimeout(total=10)
-    proxy_url = proxies.get("https") or proxies.get("http") if isinstance(proxies, dict) else None
+    proxy_url = proxies.get("https") or proxies.get("http") if proxies else None
     try:
         async with (
             aiohttp.ClientSession(cookies=cookies) as session,
-            session.get(url, timeout=timeout, proxy=proxy_url) as resp,
+            session.get(url, timeout=_REQUEST_TIMEOUT, proxy=proxy_url) as resp,
         ):
             if resp.status >= 400:
                 text = await resp.text()

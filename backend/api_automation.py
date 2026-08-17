@@ -8,6 +8,7 @@ the saved session; additional fields vary by endpoint (for example,
 event log and notifications are attempted via the notifications backend.
 """
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import logging
 from typing import Any
@@ -18,18 +19,167 @@ from backend.config import load_session
 from backend.event_log import append_ui_event_log
 from backend.mam_api import get_status
 from backend.notifications_backend import notify_event
-from backend.perk_automation import buy_upload_credit, buy_vip, buy_wedge
+from backend.perk_automation import (
+    UPLOAD_POINTS_PER_GB,
+    VALID_UPLOAD_CREDIT_GB,
+    VIP_POINTS_COST,
+    WEDGE_POINTS_COST,
+    WedgeMethod,
+    buy_upload_credit,
+    buy_vip,
+    buy_wedge,
+    parse_vip_weeks,
+)
 from backend.proxy_config import resolve_proxy_from_session_cfg
 from backend.utils_redact import redact_sensitive
 
 _logger: logging.Logger = logging.getLogger(__name__)
 
-# Point costs for the enforce-minimum-points guardrail
-_WEDGE_POINTS_COST = 50_000
-_VIP_POINTS_COST: dict[int, int] = {4: 5_000, 8: 10_000}  # weeks -> points; 90/max is variable
-_UPLOAD_POINTS_PER_GB = 500
-
 router = APIRouter()
+
+
+@dataclass(frozen=True)
+class _PerkSpec:
+    """Per-perk descriptors shared by the guardrail and finalize helpers."""
+
+    purchase_type: str
+    log_tag: str
+    noun: str
+    amount: Any
+    detail_summary: str
+    log_descriptor: str
+    status_success: str
+    status_failed: str
+    notify_details: dict[str, Any]
+    event_details: dict[str, Any]
+
+
+def redacted_error(result: Any) -> Any:
+    """Redact `result` and return its error field for logging (or the value itself)."""
+    redacted = redact_sensitive(result)
+    return redacted.get("error") if isinstance(redacted, dict) else redacted
+
+
+async def _min_points_guardrail(
+    *,
+    cfg: dict[str, Any],
+    mam_id: str,
+    proxy_cfg: dict[str, Any] | None,
+    label: str,
+    now: datetime,
+    spec: _PerkSpec,
+    purchase_cost: int,
+) -> str | None:
+    """Return a block reason if the purchase would drop below min points, else None.
+
+    When the session's minimum-points guardrail is enabled, fetches the current
+    balance and blocks the purchase (logging a `blocked` event) if spending
+    `purchase_cost` would take it below the configured minimum.
+    """
+    perk_automation = cfg.get("perk_automation", {})
+    enforce = perk_automation.get("enforce_min_points_guardrail", False)
+    min_points = perk_automation.get("min_points")
+    if not (enforce and min_points is not None):
+        return None
+    status = await get_status(mam_id=mam_id, proxy_cfg=proxy_cfg)
+    current_points = status.get("points") or 0
+    if int(current_points) - purchase_cost >= int(min_points):
+        return None
+    reason = (
+        f"Purchase would drop below minimum points: "
+        f"{current_points} - {purchase_cost} = {int(current_points) - purchase_cost} "
+        f"< {min_points}"
+    )
+    _logger.info("[%s] BLOCKED for session '%s': %s", spec.log_tag, label, reason)
+    append_ui_event_log(
+        {
+            "timestamp": now.isoformat(),
+            "label": label,
+            "event_type": "manual",
+            "trigger": "manual",
+            "purchase_type": spec.purchase_type,
+            "amount": spec.amount,
+            "details": {**spec.event_details, "points_before": current_points},
+            "result": "blocked",
+            "status_message": f"Manual {spec.noun} purchase blocked: {reason}",
+        },
+    )
+    return reason
+
+
+async def _finalize_manual_purchase(
+    result: dict[str, Any], *, label: str, now: datetime, spec: _PerkSpec
+) -> dict[str, Any]:
+    """Record the event, notify, log, and build the response for a manual purchase."""
+    success = result.get("success", False)
+    append_ui_event_log(
+        {
+            "timestamp": now.isoformat(),
+            "label": label,
+            "event_type": "manual",
+            "trigger": "manual",
+            "purchase_type": spec.purchase_type,
+            "amount": spec.amount,
+            "details": spec.event_details,
+            "result": "success" if success else "failed",
+            "error": result.get("error") if not success else None,
+            "status_message": spec.status_success if success else spec.status_failed,
+        },
+    )
+    try:
+        if success:
+            await notify_event(
+                event_type="manual_purchase_success",
+                label=label,
+                status="SUCCESS",
+                message=f"Manual {spec.noun} purchase succeeded: {spec.detail_summary}",
+                details=spec.notify_details,
+            )
+        else:
+            await notify_event(
+                event_type="manual_purchase_failure",
+                label=label,
+                status="FAILED",
+                message=f"Manual {spec.noun} purchase failed: {spec.detail_summary}",
+                details={**spec.notify_details, "error": result.get("error")},
+            )
+    except Exception:
+        _logger.debug("[%s] Manual purchase notification failed.", spec.log_tag)
+    if success:
+        _logger.info(
+            "[%s] Purchase: %s for session '%s' succeeded.",
+            spec.log_tag,
+            spec.log_descriptor,
+            label,
+        )
+    else:
+        _logger.warning(
+            "[%s] Purchase: %s for session '%s' FAILED. Error: %s",
+            spec.log_tag,
+            spec.log_descriptor,
+            label,
+            redacted_error(result),
+        )
+    return {"success": success, **result}
+
+
+async def _parse_manual_request(
+    request: Request,
+) -> tuple[dict[str, Any], str, dict[str, Any], str, dict[str, Any] | None, datetime]:
+    """Parse a manual-purchase request into its shared parts.
+
+    Returns ``(data, label, cfg, mam_id, proxy_cfg, now)``. Raises
+    ``HTTPException(400)`` when the required ``label`` field is missing.
+    """
+    data = await request.json()
+    label = data.get("label")
+    if not label:
+        raise HTTPException(status_code=400, detail="Session label required.")
+    cfg = load_session(label)
+    mam_id = cfg.get("mam", {}).get("mam_id", "")
+    proxy_cfg = resolve_proxy_from_session_cfg(cfg)
+    now = datetime.now(UTC)
+    return data, label, cfg, mam_id, proxy_cfg, now
 
 
 @router.post("/automation/upload_auto")
@@ -50,116 +200,39 @@ async def manual_upload_credit(request: Request) -> dict[str, Any]:
             request JSON.
 
     """
-    data = await request.json()
-    label = data.get("label")
+    data, label, cfg, mam_id, proxy_cfg, now = await _parse_manual_request(request)
     amount = data.get("amount", 1)
-    if not label:
-        raise HTTPException(status_code=400, detail="Session label required.")
-
-    # Validate upload credit amount - MAM only accepts certain values
-    # As of January 2026, MAM requires minimum 50GB purchase
-    valid_amounts = [50, 100]
-    if amount not in valid_amounts:
+    if amount not in VALID_UPLOAD_CREDIT_GB:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid upload credit amount: {amount}GB. Valid amounts are: {', '.join(map(str, valid_amounts))}GB",
+            detail=f"Invalid upload credit amount: {amount}GB. Valid amounts are: {', '.join(map(str, VALID_UPLOAD_CREDIT_GB))}GB",
         )
 
-    cfg = load_session(label)
-    if cfg is None:
-        _logger.warning("[ManualUpload] Session '%s' not found or not configured.", label)
-        return {"success": False, "error": f"Session '{label}' not found."}
-    mam_id = cfg.get("mam", {}).get("mam_id", "")
-
-    proxy_cfg = resolve_proxy_from_session_cfg(cfg)
-    now = datetime.now(UTC)
-    # --- Enforce minimum points guardrail (prevent spend below minimum) ---
-    enforce_min_pts = cfg.get("perk_automation", {}).get("enforce_min_points_guardrail", False)
-    session_min_points = cfg.get("perk_automation", {}).get("min_points")
-    if enforce_min_pts and session_min_points is not None:
-        status = await get_status(mam_id=mam_id, proxy_cfg=proxy_cfg)
-        current_points = status.get("points", 0) if isinstance(status, dict) else 0
-        if current_points is None:
-            current_points = 0
-        purchase_cost = amount * _UPLOAD_POINTS_PER_GB
-        if int(current_points) - purchase_cost < int(session_min_points):
-            guardrail_reason = (
-                f"Purchase would drop below minimum points: "
-                f"{current_points} - {purchase_cost} = {int(current_points) - purchase_cost} "
-                f"< {session_min_points}"
-            )
-            _logger.info("[ManualUpload] BLOCKED for session '%s': %s", label, guardrail_reason)
-            append_ui_event_log(
-                {
-                    "timestamp": now.isoformat(),
-                    "label": label,
-                    "event_type": "manual",
-                    "trigger": "manual",
-                    "purchase_type": "upload_credit",
-                    "amount": amount,
-                    "details": {"points_before": current_points},
-                    "result": "blocked",
-                    "status_message": f"Manual Upload Credit purchase blocked: {guardrail_reason}",
-                }
-            )
-            return {"success": False, "error": guardrail_reason}
-    result = await buy_upload_credit(amount, mam_id=mam_id, proxy_cfg=proxy_cfg)
-    success = result.get("success", False)
-    status_message = (
-        f"Purchased {amount}GB Upload Credit"
-        if success
-        else f"Upload Credit purchase failed ({amount}GB)"
+    spec = _PerkSpec(
+        purchase_type="upload_credit",
+        log_tag="ManualUpload",
+        noun="Upload Credit",
+        amount=amount,
+        detail_summary=f"{amount}GB",
+        log_descriptor=f"{amount}GB upload credit",
+        status_success=f"Purchased {amount}GB Upload Credit",
+        status_failed=f"Upload Credit purchase failed ({amount}GB)",
+        notify_details={"amount": amount},
+        event_details={},
     )
-    event = {
-        "timestamp": now.isoformat(),
-        "label": label,
-        "event_type": "manual",
-        "trigger": "manual",
-        "purchase_type": "upload_credit",
-        "amount": amount,
-        "details": {},
-        "result": "success" if success else "failed",
-        "error": result.get("error") if not success else None,
-        "status_message": status_message,
-    }
-    append_ui_event_log(event)
-    try:
-        if success:
-            await notify_event(
-                event_type="manual_purchase_success",
-                label=label,
-                status="SUCCESS",
-                message=f"Manual Upload Credit purchase succeeded: {amount}GB",
-                details={"amount": amount},
-            )
-        else:
-            await notify_event(
-                event_type="manual_purchase_failure",
-                label=label,
-                status="FAILED",
-                message=f"Manual Upload Credit purchase failed: {amount}GB",
-                details={"amount": amount, "error": result.get("error")},
-            )
-    except Exception:
-        _logger.debug("[ManualUpload] Manual upload credit purchase notification failed.")
-    if success:
-        _logger.info(
-            "[ManualUpload] Purchase: %sGB upload credit for session '%s' succeeded.",
-            amount,
-            label,
-        )
-    else:
-        redacted_result = redact_sensitive(result)
-        error_val = (
-            redacted_result.get("error") if isinstance(redacted_result, dict) else redacted_result
-        )
-        _logger.warning(
-            "[ManualUpload] Purchase: %sGB upload credit for session '%s' FAILED. Error: %s",
-            amount,
-            label,
-            error_val,
-        )
-    return {"success": success, **result}
+    reason = await _min_points_guardrail(
+        cfg=cfg,
+        mam_id=mam_id,
+        proxy_cfg=proxy_cfg,
+        label=label,
+        now=now,
+        spec=spec,
+        purchase_cost=amount * UPLOAD_POINTS_PER_GB,
+    )
+    if reason:
+        return {"success": False, "error": reason}
+    result = await buy_upload_credit(amount, mam_id=mam_id, proxy_cfg=proxy_cfg)
+    return await _finalize_manual_purchase(result, label=label, now=now, spec=spec)
 
 
 @router.post("/automation/wedge")
@@ -180,105 +253,35 @@ async def manual_wedge(request: Request) -> dict[str, Any]:
             request JSON.
 
     """
-    data = await request.json()
-    label = data.get("label")
-    method = data.get("method", "points")
-    if not label:
-        raise HTTPException(status_code=400, detail="Session label required.")
-    cfg = load_session(label)
-    if cfg is None:
-        _logger.warning("[ManualWedge] Session '%s' not found or not configured.", label)
-        return {"success": False, "error": f"Session '{label}' not found."}
-    mam_id = cfg.get("mam", {}).get("mam_id", "")
-
-    proxy_cfg = resolve_proxy_from_session_cfg(cfg)
-    now = datetime.now(UTC)
-    # --- Enforce minimum points guardrail (prevent spend below minimum) ---
-    # Only applies to points method; cheese method has no point cost
-    enforce_min_pts = cfg.get("perk_automation", {}).get("enforce_min_points_guardrail", False)
-    session_min_points = cfg.get("perk_automation", {}).get("min_points")
-    if enforce_min_pts and session_min_points is not None and method == "points":
-        status = await get_status(mam_id=mam_id, proxy_cfg=proxy_cfg)
-        current_points = status.get("points", 0) if isinstance(status, dict) else 0
-        if current_points is None:
-            current_points = 0
-        purchase_cost = _WEDGE_POINTS_COST
-        if int(current_points) - purchase_cost < int(session_min_points):
-            guardrail_reason = (
-                f"Purchase would drop below minimum points: "
-                f"{current_points} - {purchase_cost} = {int(current_points) - purchase_cost} "
-                f"< {session_min_points}"
-            )
-            _logger.info("[ManualWedge] BLOCKED for session '%s': %s", label, guardrail_reason)
-            append_ui_event_log(
-                {
-                    "timestamp": now.isoformat(),
-                    "label": label,
-                    "event_type": "manual",
-                    "trigger": "manual",
-                    "purchase_type": "wedge",
-                    "amount": 1,
-                    "details": {"method": method, "points_before": current_points},
-                    "result": "blocked",
-                    "status_message": f"Manual Wedge purchase blocked: {guardrail_reason}",
-                }
-            )
-            return {"success": False, "error": guardrail_reason}
-    result = await buy_wedge(mam_id, method=method, proxy_cfg=proxy_cfg)
-    success = result.get("success", False)
-    status_message = (
-        f"Purchased Wedge ({method})" if success else f"Wedge purchase failed ({method})"
+    data, label, cfg, mam_id, proxy_cfg, now = await _parse_manual_request(request)
+    method: WedgeMethod = data.get("method", "points")
+    spec = _PerkSpec(
+        purchase_type="wedge",
+        log_tag="ManualWedge",
+        noun="Wedge",
+        amount=1,
+        detail_summary=method,
+        log_descriptor=f"Wedge ({method})",
+        status_success=f"Purchased Wedge ({method})",
+        status_failed=f"Wedge purchase failed ({method})",
+        notify_details={"method": method},
+        event_details={"method": method},
     )
-    event = {
-        "timestamp": now.isoformat(),
-        "label": label,
-        "event_type": "manual",
-        "trigger": "manual",
-        "purchase_type": "wedge",
-        "amount": 1,
-        "details": {"method": method},
-        "result": "success" if success else "failed",
-        "error": result.get("error") if not success else None,
-        "status_message": status_message,
-    }
-    append_ui_event_log(event)
-    try:
-        if success:
-            await notify_event(
-                event_type="manual_purchase_success",
-                label=label,
-                status="SUCCESS",
-                message=f"Manual Wedge purchase succeeded: {method}",
-                details={"method": method},
-            )
-        else:
-            await notify_event(
-                event_type="manual_purchase_failure",
-                label=label,
-                status="FAILED",
-                message=f"Manual Wedge purchase failed: {method}",
-                details={"method": method, "error": result.get("error")},
-            )
-    except Exception:
-        _logger.debug("[ManualWedge] Manual wedge purchse notification failed.")
-    if success:
-        _logger.info(
-            "[ManualWedge] Purchase: Wedge (%s) for session '%s' succeeded.",
-            method,
-            label,
+    # Guardrail only applies to the points method; the cheese method has no point cost
+    if method == "points":
+        reason = await _min_points_guardrail(
+            cfg=cfg,
+            mam_id=mam_id,
+            proxy_cfg=proxy_cfg,
+            label=label,
+            now=now,
+            spec=spec,
+            purchase_cost=WEDGE_POINTS_COST,
         )
-    else:
-        redacted_result = redact_sensitive(result)
-        error_val = (
-            redacted_result.get("error") if isinstance(redacted_result, dict) else redacted_result
-        )
-        _logger.warning(
-            "[ManualWedge] Purchase: Wedge (%s) for session '%s' FAILED. Error: %s",
-            method,
-            label,
-            error_val,
-        )
-    return {"success": success, **result}
+        if reason:
+            return {"success": False, "error": reason}
+    result = await buy_wedge(mam_id, method=method, proxy_cfg=proxy_cfg)
+    return await _finalize_manual_purchase(result, label=label, now=now, spec=spec)
 
 
 @router.post("/automation/vip")
@@ -299,160 +302,39 @@ async def manual_vip(request: Request) -> dict[str, Any]:
             request JSON.
 
     """
-    data = await request.json()
-    label = data.get("label")
-    weeks = data.get("weeks", 4)
-    if not label:
-        raise HTTPException(status_code=400, detail="Session label required.")
-    cfg = load_session(label)
-    if cfg is None:
-        _logger.warning("[ManualVIP] Session '%s' not found or not configured.", label)
-        return {"success": False, "error": f"Session '{label}' not found."}
-    mam_id = cfg.get("mam", {}).get("mam_id", "")
-    proxy_cfg = resolve_proxy_from_session_cfg(cfg)
-    now = datetime.now(UTC)
-    is_max = str(weeks).lower() in ["max", "90"]
-    # --- Enforce minimum points guardrail (prevent spend below minimum) ---
-    # Max/90-week VIP has variable cost; guardrail is skipped for that case
-    enforce_min_pts = cfg.get("perk_automation", {}).get("enforce_min_points_guardrail", False)
-    session_min_points = cfg.get("perk_automation", {}).get("min_points")
-    if enforce_min_pts and session_min_points is not None and not is_max:
-        purchase_cost = _VIP_POINTS_COST.get(int(weeks)) if int(weeks) in _VIP_POINTS_COST else None
-        if purchase_cost is not None:
-            status = await get_status(mam_id=mam_id, proxy_cfg=proxy_cfg)
-            current_points = status.get("points", 0) if isinstance(status, dict) else 0
-            if current_points is None:
-                current_points = 0
-            if int(current_points) - purchase_cost < int(session_min_points):
-                guardrail_reason = (
-                    f"Purchase would drop below minimum points: "
-                    f"{current_points} - {purchase_cost} = {int(current_points) - purchase_cost} "
-                    f"< {session_min_points}"
-                )
-                _logger.info("[ManualVIP] BLOCKED for session '%s': %s", label, guardrail_reason)
-                append_ui_event_log(
-                    {
-                        "timestamp": now.isoformat(),
-                        "label": label,
-                        "event_type": "manual",
-                        "trigger": "manual",
-                        "purchase_type": "vip",
-                        "amount": weeks,
-                        "details": {"points_before": current_points},
-                        "result": "blocked",
-                        "status_message": f"Manual VIP purchase blocked: {guardrail_reason}",
-                    }
-                )
-                return {"success": False, "error": guardrail_reason}
-    if is_max:
-        result = await buy_vip(mam_id, duration="max", proxy_cfg=proxy_cfg)
-        success = result.get("success", False)
-        status_message = (
-            "Purchased VIP (Max me out!)" if success else "VIP purchase failed (Max me out!)"
-        )
-        event = {
-            "timestamp": now.isoformat(),
-            "label": label,
-            "event_type": "manual",
-            "trigger": "manual",
-            "purchase_type": "vip",
-            "amount": "max",
-            "details": {},
-            "result": "success" if success else "failed",
-            "error": result.get("error") if not success else None,
-            "status_message": status_message,
-        }
-        append_ui_event_log(event)
-        try:
-            if success:
-                await notify_event(
-                    event_type="manual_purchase_success",
-                    label=label,
-                    status="SUCCESS",
-                    message="Manual VIP purchase succeeded: Max me out!",
-                    details={"weeks": "max"},
-                )
-            else:
-                await notify_event(
-                    event_type="manual_purchase_failure",
-                    label=label,
-                    status="FAILED",
-                    message="Manual VIP purchase failed: Max me out!",
-                    details={"weeks": "max", "error": result.get("error")},
-                )
-        except Exception:
-            _logger.debug("[ManualVIP] Manual VIP (max) purchase notification failed.")
-        if success:
-            _logger.info(
-                "[ManualVIP] Purchase: VIP (max) for session '%s' succeeded.",
-                label,
-            )
-        else:
-            redacted_result = redact_sensitive(result)
-            error_val = (
-                redacted_result.get("error")
-                if isinstance(redacted_result, dict)
-                else redacted_result
-            )
-            _logger.warning(
-                "[ManualVIP] Purchase: VIP (max) for session '%s' FAILED. Error: %s",
-                label,
-                error_val,
-            )
-        return {"success": success, **result}
-    # For 4 or 8 weeks, just send the value as string
-    result = await buy_vip(mam_id, duration=str(weeks), proxy_cfg=proxy_cfg)
-    success = result.get("success", False)
-    status_message = (
-        f"Purchased VIP ({weeks} weeks)" if success else f"VIP purchase failed ({weeks} weeks)"
-    )
-    event = {
-        "timestamp": now.isoformat(),
-        "label": label,
-        "event_type": "manual",
-        "trigger": "manual",
-        "purchase_type": "vip",
-        "amount": weeks,
-        "details": {},
-        "result": "success" if success else "failed",
-        "error": result.get("error") if not success else None,
-        "status_message": status_message,
-    }
-    append_ui_event_log(event)
+    data, label, cfg, mam_id, proxy_cfg, now = await _parse_manual_request(request)
     try:
-        if success:
-            await notify_event(
-                event_type="manual_purchase_success",
+        weeks = parse_vip_weeks(data.get("weeks", 4))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    duration = str(weeks)
+    label_desc = "Max me out!" if weeks == "max" else f"{weeks} weeks"
+    spec = _PerkSpec(
+        purchase_type="vip",
+        log_tag="ManualVIP",
+        noun="VIP",
+        amount=weeks,
+        detail_summary=label_desc,
+        log_descriptor="VIP (max)" if weeks == "max" else f"VIP ({weeks} weeks)",
+        status_success=f"Purchased VIP ({label_desc})",
+        status_failed=f"VIP purchase failed ({label_desc})",
+        notify_details={"weeks": weeks},
+        event_details={},
+    )
+    # Max/90-week VIP has variable cost; the guardrail only applies to known fixed durations
+    if weeks != "max":
+        purchase_cost = VIP_POINTS_COST.get(weeks)
+        if purchase_cost is not None:
+            reason = await _min_points_guardrail(
+                cfg=cfg,
+                mam_id=mam_id,
+                proxy_cfg=proxy_cfg,
                 label=label,
-                status="SUCCESS",
-                message=f"Manual VIP purchase succeeded: {weeks} weeks",
-                details={"weeks": weeks},
+                now=now,
+                spec=spec,
+                purchase_cost=purchase_cost,
             )
-        else:
-            await notify_event(
-                event_type="manual_purchase_failure",
-                label=label,
-                status="FAILED",
-                message=f"Manual VIP purchase failed: {weeks} weeks",
-                details={"weeks": weeks, "error": result.get("error")},
-            )
-    except Exception:
-        _logger.debug("[ManualVIP] Manual VIP purchase notification failed.")
-    if success:
-        _logger.info(
-            "[ManualVIP] Purchase: VIP (%s weeks) for session '%s' succeeded.",
-            weeks,
-            label,
-        )
-    else:
-        redacted_result = redact_sensitive(result)
-        error_val = (
-            redacted_result.get("error") if isinstance(redacted_result, dict) else redacted_result
-        )
-        _logger.warning(
-            "[ManualVIP] Purchase: VIP (%s weeks) for session '%s' FAILED. Error: %s",
-            weeks,
-            label,
-            error_val,
-        )
-    return {"success": success, **result}
+            if reason:
+                return {"success": False, "error": reason}
+    result = await buy_vip(mam_id, duration=duration, proxy_cfg=proxy_cfg)
+    return await _finalize_manual_purchase(result, label=label, now=now, spec=spec)

@@ -4,7 +4,7 @@ This module exposes two endpoints under `/last_session`:
 - GET `/last_session`: returns the last saved session label (or None).
 - POST `/last_session`: accepts JSON {"label": "..."} and persists it.
 
-Persistence is a simple YAML file located at `LAST_SESSION_FILE`.
+Persistence is a simple YAML file located at `LAST_SESSION_PATH`.
 """
 
 from typing import Any
@@ -12,10 +12,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 import yaml
 
-from backend.config import CONFIG_DIR
+from backend.paths import LAST_SESSION_PATH
 
 router = APIRouter()
-LAST_SESSION_FILE = CONFIG_DIR / "last_session.yaml"
 
 
 def read_last_session() -> str | None:
@@ -24,11 +23,10 @@ def read_last_session() -> str | None:
     Returns:
         The saved label string, or None if the file does not exist or is malformed.
     """
-    if not LAST_SESSION_FILE.exists():
+    if not LAST_SESSION_PATH.exists():
         return None
-    with LAST_SESSION_FILE.open(encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-        return data.get("label") if isinstance(data, dict) else None
+    with LAST_SESSION_PATH.open(encoding="utf-8") as f:
+        return data.get("label") if isinstance(data := yaml.safe_load(f), dict) else None
 
 
 def write_last_session(label: str | None) -> None:
@@ -37,9 +35,9 @@ def write_last_session(label: str | None) -> None:
     Args:
         label: The session label to persist.
     """
-    LAST_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with LAST_SESSION_FILE.open("w", encoding="utf-8") as f:
-        yaml.safe_dump({"label": label if label else ""}, f)
+    LAST_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LAST_SESSION_PATH.open("w", encoding="utf-8") as f:
+        yaml.safe_dump({"label": label or ""}, f)
 
 
 @router.get("/last_session")
@@ -49,10 +47,7 @@ def get_last_session() -> dict[str, Any]:
     Returns:
         A JSON object with the key "label" whose value is the saved label or None.
     """
-    label = read_last_session()
-    if label is None:
-        return {"label": None}
-    return {"label": label}
+    return {"label": read_last_session()}
 
 
 @router.post("/last_session")
@@ -64,8 +59,7 @@ async def set_last_session(request: Request) -> dict[str, Any]:
     Raises:
         HTTPException(400) if `label` is missing from the request body.
     """
-    data = await request.json()
-    label = data.get("label")
+    label = (await request.json()).get("label")
     if not label:
         raise HTTPException(status_code=400, detail="Label required.")
     write_last_session(label)

@@ -32,8 +32,7 @@ def build_service_url(host: str, port: int | str | None, path: str = "") -> str:
     # re-infer it from the port so the two fields stay consistent.
     if parsed.scheme in {"http", "https"}:
         # urlparse puts the real hostname in parsed.netloc (may include port)
-        host = parsed.netloc or parsed.path
-        host = host.rstrip("/")
+        host = (parsed.netloc or parsed.path).rstrip("/")
 
     # Strip an embedded port from the hostname (e.g. "myhost:9696")
     if ":" in host:
@@ -47,6 +46,4 @@ def build_service_url(host: str, port: int | str | None, path: str = "") -> str:
 
     port_int = int(port)
     scheme = "https" if port_int == 443 else "http"
-    base = f"{scheme}://{host}:{port_int}"
-
-    return f"{base}{path}"
+    return f"{scheme}://{host}:{port_int}{path}"

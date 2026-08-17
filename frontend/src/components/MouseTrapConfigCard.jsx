@@ -334,8 +334,8 @@ export default function MouseTrapConfigCard({
                 value={sessionType || ''}
               >
                 <MenuItem value="">Select...</MenuItem>
-                <MenuItem value="IP Locked">IP Locked</MenuItem>
-                <MenuItem value="ASN Locked">ASN Locked</MenuItem>
+                <MenuItem value="ip">IP Locked</MenuItem>
+                <MenuItem value="asn">ASN Locked</MenuItem>
               </Select>
             </FormControl>
 

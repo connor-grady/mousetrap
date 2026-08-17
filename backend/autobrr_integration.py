@@ -135,9 +135,7 @@ async def sync_mam_id_to_autobrr(
                 indexer_data = await response.json()
 
             # Update the settings.cookie field with proper format: mam_id=<session-id>
-            if "settings" not in indexer_data:
-                indexer_data["settings"] = {}
-            indexer_data["settings"]["cookie"] = f"mam_id={new_mam_id}"
+            indexer_data.setdefault("settings", {})["cookie"] = f"mam_id={new_mam_id}"
 
             # Send PUT request to update indexer
             put_url = build_service_url(host, port, f"/api/indexer/{indexer_id}")
